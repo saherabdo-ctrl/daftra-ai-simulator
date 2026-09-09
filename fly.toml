@@ -1,0 +1,56 @@
+# ============================================================
+#  HiringFlow AI Simulator — Fly.io Configuration
+#  Single-process: server.py + agent.py in one container.
+#
+#  Setup:
+#    fly launch --copy-config --name hiringflow
+#    fly secrets set LIVEKIT_URL=... LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... \
+#      GROQ_API_KEY=... DEEPGRAM_API_KEY=... GEMINI_API_KEY=... \
+#      JWT_SECRET=<random-64-char-string> ADMIN_PASSWORD=<strong-password>
+#    fly volumes create data --region fra --size 1
+#    fly deploy
+#
+#  Scale memory if OOM (agent needs ~512MB for Silero VAD):
+#    fly scale memory 1024
+# ============================================================
+app = "hiringflow"
+primary_region = "fra"
+
+[processes]
+  web = "python server.py"
+
+[env]
+  PORT = "8000"
+  EVALUATION_WEBHOOK_URL = "http://localhost:8000/api/results"
+  SCENARIOS_BASE_URL = "http://localhost:8000"
+  RECORDINGS_PATH = "/recordings"
+
+# Two separate volumes:
+#   data      → /app/data      (users.json, results, scenarios, corpus — small files, critical)
+#   recordings → /recordings   (audio recordings, transcripts, evaluations — large files)
+[[mounts]]
+  source = "data"
+  destination = "/app/data"
+
+[[mounts]]
+  source = "recordings"
+  destination = "/recordings"
+
+[http_service]
+  internal_port = 8000
+  protocol = "tcp"
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 100
+    soft_limit = 80
+
+[[http_service.checks]]
+  grace_period = "10s"
+  interval = "30s"
+  method = "GET"
+  path = "/health"
+  timeout = "5s"

@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: hiringflow
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: EVALUATION_WEBHOOK_URL
+        value: http://localhost:10000/api/results
+      - key: SCENARIOS_BASE_URL
+        value: http://localhost:10000
+      - key: RECORDINGS_PATH
+        value: /tmp/recordings
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: DEEPGRAM_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: ELEVEN_API_KEY
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_PASSWORD
+        generateValue: true
+    healthCheckPath: /health
+    autoDeploy: false

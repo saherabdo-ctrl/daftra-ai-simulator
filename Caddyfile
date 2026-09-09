@@ -1,0 +1,5 @@
+# ضع هنا النطاق المجاني من DuckDNS (مثال: sdr-lab.duckdns.org)
+# — شهادة HTTPS تصدر تلقائيًا عبر Let's Encrypt
+YOUR-SUB.duckdns.org {
+	reverse_proxy web:8000
+}
