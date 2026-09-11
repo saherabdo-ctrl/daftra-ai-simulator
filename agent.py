@@ -19,7 +19,7 @@ import httpx
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
-from livekit.agents import Agent, AgentServer, AgentSession, JobContext, JobProcess, cli, llm, TurnHandlingOptions
+from livekit.agents import Agent, AgentServer, AgentSession, JobContext, JobExecutorType, JobProcess, cli, llm, TurnHandlingOptions
 from livekit.plugins import deepgram, groq, openai
 from livekit.plugins import silero
 import livekit.rtc
@@ -584,14 +584,11 @@ class CustomerAgent(Agent):
             logger.info("Result POSTed for room %s (HTTP %s)", self.room_name, response.status_code)
 
 
-server = AgentServer()
-
-
-def prewarm(proc: JobProcess) -> None:
-    proc.userdata["vad"] = silero.VAD.load()
-
-
-server.setup_fnc = prewarm
+server = AgentServer(
+    job_executor=JobExecutorType.THREAD,
+    num_idle_processes=0,
+    prewarm_absent=True,
+)
 
 
 @server.rtc_session(agent_name=AGENT_NAME)
@@ -611,11 +608,14 @@ async def entrypoint(ctx: JobContext) -> None:
 
     logger.info("Agent dispatched to %s for scenario %s (user=%s, industry=%s)", ctx.room.name, scenario["id"], username, industry)
 
+    # Load VAD lazily (no prewarm — avoids multiprocessing fork issues in cloud)
+    vad = silero.VAD.load()
+
     session = AgentSession(
         stt=_make_stt(),
         llm=_make_llm(max_completion_tokens=GROQ_LLM_MAX_TOKENS),
         tts=_make_tts(scenario),
-        vad=ctx.proc.userdata["vad"],
+        vad=vad,
         turn_handling=TurnHandlingOptions(
             preemptive_generation={"preemptive_tts": True},
             interruption={"enabled": True},
