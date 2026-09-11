@@ -7,3 +7,4 @@ livekit-agents[groq,deepgram,silero]>=1.5.0
 edge-tts>=7.0
 a2wsgi>=0.5.0
 PyJWT>=2.8
+python-multipart>=0.0.18
