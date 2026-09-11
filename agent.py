@@ -34,6 +34,49 @@ load_dotenv()
 logger = logging.getLogger("sdr-agent")
 logger.setLevel(logging.INFO)
 
+
+def _validate_env():
+    """Validate critical environment variables at startup. Fail fast with clear error."""
+    errors = []
+    url = os.getenv("LIVEKIT_URL", "").strip()
+    key = os.getenv("LIVEKIT_API_KEY", "").strip()
+    secret = os.getenv("LIVEKIT_API_SECRET", "").strip()
+
+    if not url:
+        errors.append("LIVEKIT_URL is not set")
+    elif "your-project" in url or "your_" in url:
+        errors.append(f"LIVEKIT_URL contains placeholder value — set real URL from LiveKit Cloud dashboard")
+
+    if not key:
+        errors.append("LIVEKIT_API_KEY is not set")
+    elif key.startswith("your_") or len(key) < 10:
+        errors.append("LIVEKIT_API_KEY appears to be a placeholder")
+
+    if not secret:
+        errors.append("LIVEKIT_API_SECRET is not set")
+    elif secret.startswith("your_") or len(secret) < 10:
+        errors.append("LIVEKIT_API_SECRET appears to be a placeholder")
+
+    if errors:
+        print("=" * 60)
+        print("FATAL: LiveKit configuration errors — agent cannot start")
+        for e in errors:
+            print(f"  ✗ {e}")
+        print("")
+        print("Set these environment variables in your deployment dashboard:")
+        print("  LIVEKIT_URL=wss://your-project.livekit.cloud")
+        print("  LIVEKIT_API_KEY=your_api_key")
+        print("  LIVEKIT_API_SECRET=your_api_secret")
+        print("")
+        print("Get these from: https://cloud.livekit.io → project → Settings → Keys")
+        print("=" * 60)
+        raise SystemExit(1)
+
+    logger.info("LiveKit configuration validated ✓")
+
+
+_validate_env()
+
 AGENT_NAME = os.getenv("AGENT_NAME", "sdr-training-agent")
 WEBHOOK_URL = os.getenv("EVALUATION_WEBHOOK_URL", "http://localhost:8000/api/results")
 WEBHOOK_SECRET = os.getenv("AGENT_WEBHOOK_SECRET", "")

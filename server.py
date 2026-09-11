@@ -44,9 +44,30 @@ AGENT_NAME = os.getenv("AGENT_NAME", "sdr-training-agent")
 WEBHOOK_SECRET = os.getenv("AGENT_WEBHOOK_SECRET", "")
 PORT = int(os.getenv("PORT", "8000"))
 
-if not LIVEKIT_URL or not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
-    print("WARNING: LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET are not all set. "
-          "Token generation will fail until you configure .env")
+# Validate LiveKit configuration at startup
+_livekit_errors = []
+if not LIVEKIT_URL:
+    _livekit_errors.append("LIVEKIT_URL is not set")
+elif "your-project" in LIVEKIT_URL or "your_" in LIVEKIT_URL:
+    _livekit_errors.append("LIVEKIT_URL contains placeholder — set real URL from LiveKit Cloud dashboard")
+if not LIVEKIT_API_KEY:
+    _livekit_errors.append("LIVEKIT_API_KEY is not set")
+elif LIVEKIT_API_KEY.startswith("your_") or len(LIVEKIT_API_KEY) < 10:
+    _livekit_errors.append("LIVEKIT_API_KEY appears to be a placeholder")
+if not LIVEKIT_API_SECRET:
+    _livekit_errors.append("LIVEKIT_API_SECRET is not set")
+elif LIVEKIT_API_SECRET.startswith("your_") or len(LIVEKIT_API_SECRET) < 10:
+    _livekit_errors.append("LIVEKIT_API_SECRET appears to be a placeholder")
+
+if _livekit_errors:
+    print("=" * 60)
+    print("WARNING: LiveKit configuration issues — token generation will fail")
+    for e in _livekit_errors:
+        print(f"  ✗ {e}")
+    print("  Set these in your deployment dashboard (NOT in source code)")
+    print("=" * 60)
+else:
+    print("[server] LiveKit configuration validated ✓")
 
 app = FastAPI(title="SDR AI Training Lab")
 
