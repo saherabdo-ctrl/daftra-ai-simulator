@@ -22,25 +22,27 @@ AGENT_PID=$!
 
 echo "[entrypoint] Server PID=$SERVER_PID, Agent PID=$AGENT_PID"
 
-# Handle shutdown signals
+# Handle shutdown signals (POSIX-compatible trap syntax)
 cleanup() {
     echo "[entrypoint] Shutting down..."
-    kill $AGENT_PID 2>/dev/null || true
-    kill $SERVER_PID 2>/dev/null || true
-    wait $AGENT_PID 2>/dev/null || true
-    wait $SERVER_PID 2>/dev/null || true
+    kill "$AGENT_PID" 2>/dev/null || true
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$AGENT_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
     echo "[entrypoint] Shutdown complete."
 }
-trap cleanup SIGTERM SIGINT
+trap 'cleanup' TERM
+trap 'cleanup' INT
+trap 'cleanup' EXIT
 
 # Monitor both processes — exit if either dies
 while true; do
-    if ! kill -0 $SERVER_PID 2>/dev/null; then
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
         echo "[entrypoint] Server process died"
         cleanup
         exit 1
     fi
-    if ! kill -0 $AGENT_PID 2>/dev/null; then
+    if ! kill -0 "$AGENT_PID" 2>/dev/null; then
         echo "[entrypoint] Agent process died"
         cleanup
         exit 1
