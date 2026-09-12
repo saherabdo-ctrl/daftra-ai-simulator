@@ -555,7 +555,7 @@ class CustomerAgent(Agent):
             sheets = get_sheets_client()
 
             # Update status to ended
-            timestamp = datetime.utcnow().isoformat()
+            timestamp = datetime.now(timezone.utc).isoformat()
             sheets.update_candidate_status(self.candidate_id, 'ended', timestamp)
 
             # Update score and result
@@ -606,9 +606,14 @@ class CustomerAgent(Agent):
                 logger.warning("Failed to create Drive folder for %s", self.candidate_id)
                 return None
 
-            # Upload recording (MP3)
-            mp3_path = os.path.join(call_dir, "recording.mp3")
-            if os.path.exists(mp3_path):
+            # Upload recording (find any MP3 in call_dir)
+            mp3_path = None
+            if os.path.exists(call_dir):
+                for f in os.listdir(call_dir):
+                    if f.endswith(".mp3"):
+                        mp3_path = os.path.join(call_dir, f)
+                        break
+            if mp3_path:
                 upload_file(drive, mp3_path, folder_id)
 
             # Upload transcript
