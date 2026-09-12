@@ -59,6 +59,7 @@ const api = {
   candidateLogin: (email, candidate_id) =>
     api.post('/api/candidate/login', { email, candidate_id }),
   candidateStartCall: () => api.post('/api/candidate/start-call', {}),
+  candidateEndCall: () => api.post('/api/candidate/end-call', {}),
   candidateStatus: () => api.get('/api/candidate/status'),
 };
 
@@ -1229,6 +1230,9 @@ function renderCandidateCall(credentials) {
             <div>⏱ <span id="call-duration">00:00</span></div>
           </div>
         </div>
+        <div id="self-video-wrap" style="margin: 0.5rem 0; text-align: center;">
+          <video id="self-video" autoplay muted playsinline style="width: 100%; max-width: 400px; border-radius: 8px; background: #000; display: block; margin: 0 auto;"></video>
+        </div>
         <p id="call-status" class="status">Connecting...</p>
         <div class="meter-wrap" title="Customer audio">
           <div class="meter" id="audio-meter"></div>
@@ -1239,6 +1243,12 @@ function renderCandidateCall(credentials) {
         </div>
       </div>
     </main>`);
+
+  // Attach candidate camera stream to the self-video element
+  const selfVideo = document.getElementById('self-video');
+  if (selfVideo && candidateStream) {
+    selfVideo.srcObject = candidateStream;
+  }
 
   // Connect to LiveKit
   connectCandidateCall(credentials);
@@ -1327,8 +1337,10 @@ function onCandidateDisconnected() {
   }
 }
 
-function endCandidateCall() {
+async function endCandidateCall() {
   stopTimer();
+  // Notify server to write ended status + TestCallEndedAt immediately
+  try { await api.candidateEndCall(); } catch (_) {}
   if (room) {
     try { room.disconnect(); } catch (_) {}
   }

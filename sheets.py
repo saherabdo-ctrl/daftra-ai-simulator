@@ -16,7 +16,7 @@ logger = logging.getLogger("sheets")
 
 SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
-    'https://www.googleapis.com/auth/drive.readonly',
+    'https://www.googleapis.com/auth/drive',
 ]
 
 # Column indices for Candidates sheet (1-indexed)

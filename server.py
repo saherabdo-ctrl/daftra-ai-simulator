@@ -325,6 +325,42 @@ async def candidate_start_call(request: Request) -> dict:
         raise HTTPException(status_code=500, detail=f"Failed to start call: {str(e)}")
 
 
+@app.post("/api/candidate/end-call")
+async def candidate_end_call(request: Request) -> dict:
+    """End test call for candidate.
+
+    Requires Candidate JWT.
+    Transitions status: started → ended
+    Writes TestCallEndedAt immediately.
+    """
+    auth_header = request.headers.get('Authorization', '')
+    token = auth_header[7:] if auth_header.startswith('Bearer ') else ''
+    payload = auth.user_from_token(token)
+
+    if not payload or payload.get('user_type') != 'CANDIDATE':
+        raise HTTPException(status_code=401, detail="Candidate authentication required")
+
+    candidate_id = payload.get('candidate_id')
+    if not candidate_id:
+        raise HTTPException(status_code=400, detail="Invalid candidate token")
+
+    try:
+        from sheets import get_sheets_client
+        sheets = get_sheets_client()
+
+        timestamp = datetime.utcnow().isoformat()
+        sheets.update_candidate_status(candidate_id, 'ended', timestamp)
+
+        logger.info("Candidate %s end-call: status=ended, timestamp=%s", candidate_id, timestamp)
+        return {"status": "ended", "timestamp": timestamp}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning("Failed to end candidate call: %s", e)
+        raise HTTPException(status_code=500, detail=f"Failed to end call: {str(e)}")
+
+
 @app.get("/api/candidate/status")
 async def candidate_status(request: Request) -> dict:
     """Get candidate test call status.

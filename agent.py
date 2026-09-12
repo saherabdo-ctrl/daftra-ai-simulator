@@ -14,7 +14,7 @@ import logging
 import os
 import time
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 from dotenv import load_dotenv
@@ -482,7 +482,12 @@ class CustomerAgent(Agent):
             return
         try:
             duration = max(0, round(time.monotonic() - self.started_at))
-            result = await self._evaluate(duration)
+            result = None
+            try:
+                result = await self._evaluate(duration)
+            except Exception as e:
+                logger.warning("LLM evaluation failed for room %s: %s", self.room_name, e)
+
             if result:
                 logger.info(
                     "Evaluation ready for room %s: score=%.1f grade=%s — posting result",
@@ -497,19 +502,46 @@ class CustomerAgent(Agent):
                         json.dump(result, f, ensure_ascii=False, indent=2)
                 except Exception as e:
                     logger.warning("Failed to save evaluation: %s", e)
+            else:
+                # Fallback: LLM eval failed, build minimal result with transcript
+                logger.warning("Using fallback result for room %s (LLM eval unavailable)", self.room_name)
+                result = {
+                    "scenario": self.scenario.get("id", ""),
+                    "scenario_name": self.scenario.get("name", ""),
+                    "customer_name": self.scenario.get("customer_name", ""),
+                    "duration_seconds": duration,
+                    "transcript": self.transcript,
+                    "scores": {},
+                    "overall_score": 0,
+                    "strengths": [],
+                    "areas_for_improvement": [],
+                    "coaching": "Evaluation was unavailable. Score defaults to 0.",
+                    "next_step_action": "",
+                    "lead_status": "unrated",
+                    "lead_status_reason": "LLM evaluation failed",
+                }
+                # Save fallback evaluation
+                try:
+                    call_dir = self._get_call_dir()
+                    os.makedirs(call_dir, exist_ok=True)
+                    eval_path = os.path.join(call_dir, "evaluation.json")
+                    with open(eval_path, "w", encoding="utf-8") as f:
+                        json.dump(result, f, ensure_ascii=False, indent=2)
+                except Exception as e:
+                    logger.warning("Failed to save fallback evaluation: %s", e)
 
-                # Post result to local webhook (existing behavior)
-                await self._post_result(result)
+            # Post result to local webhook
+            await self._post_result(result)
 
-                # Handle candidate-specific post-call actions
-                if self.user_type == "CANDIDATE":
-                    await self._handle_candidate_completion(result)
+            # Handle candidate-specific post-call actions
+            if self.user_type == "CANDIDATE":
+                await self._handle_candidate_completion(result)
 
-                # Send results to HiringFlow if callback_url is configured
-                if self.callback_url:
-                    await self._send_hiringflow_callback(result)
+            # Send results to HiringFlow if callback_url is configured
+            if self.callback_url:
+                await self._send_hiringflow_callback(result)
 
-                self._reported = True
+            self._reported = True
         except Exception:
             logger.exception("Evaluation failed for room %s", self.room_name)
 
@@ -527,15 +559,179 @@ class CustomerAgent(Agent):
             sheets.update_candidate_status(self.candidate_id, 'ended', timestamp)
 
             # Update score and result
-            overall_score = result.get('overall_score', 0)
-            pass_result = 'PASSED' if overall_score >= 70 else 'REJECTED'
+            overall_score = result.get('overall_score', 0) if result else 0
+            pass_result = 'Passed' if overall_score >= 70 else 'Failed'
             sheets.update_candidate_result(self.candidate_id, overall_score, pass_result)
 
-            logger.info("Candidate %s completion updated: score=%d, result=%s",
-                       self.candidate_id, overall_score, pass_result)
+            # Upload to Google Drive and get evaluation link
+            eval_link = await self._upload_to_drive(result)
+
+            # Update evaluation link in sheet (column X)
+            if eval_link:
+                sheets.update_candidate_evaluation(self.candidate_id, eval_link)
+
+            logger.info("Candidate %s completion updated: score=%d, result=%s, eval_link=%s",
+                       self.candidate_id, overall_score, pass_result, eval_link or 'none')
 
         except Exception as e:
             logger.warning("Failed to update candidate completion: %s", e)
+
+    async def _upload_to_drive(self, result: dict) -> Optional[str]:
+        """Upload recording + evaluation to Google Drive in candidate subfolder.
+
+        Returns shareable link to the evaluation card, or None on failure.
+        """
+        try:
+            from drive_upload import (
+                get_drive_client,
+                find_or_create_folder,
+                upload_file,
+                get_shareable_link,
+                FOLDER_NAME,
+            )
+        except ImportError:
+            logger.warning("drive_upload module not available — skipping Drive upload")
+            return None
+
+        if not self.candidate_id:
+            return None
+
+        try:
+            drive = get_drive_client()
+            call_dir = self._get_call_dir()
+
+            # Find or create candidate subfolder
+            folder_id = find_or_create_folder(drive, self.candidate_id, parent_name=FOLDER_NAME)
+            if not folder_id:
+                logger.warning("Failed to create Drive folder for %s", self.candidate_id)
+                return None
+
+            # Upload recording (MP3)
+            mp3_path = os.path.join(call_dir, "recording.mp3")
+            if os.path.exists(mp3_path):
+                upload_file(drive, mp3_path, folder_id)
+
+            # Upload transcript
+            transcript_path = os.path.join(call_dir, "transcript.json")
+            if os.path.exists(transcript_path):
+                upload_file(drive, transcript_path, folder_id)
+
+            # Generate and upload evaluation card
+            eval_html = self._generate_eval_card(result)
+            if eval_html:
+                eval_path = os.path.join(call_dir, "evaluation.html")
+                with open(eval_path, "w", encoding="utf-8") as f:
+                    f.write(eval_html)
+                upload_file(drive, eval_path, folder_id)
+
+            # Also upload raw evaluation JSON
+            eval_json_path = os.path.join(call_dir, "evaluation.json")
+            if os.path.exists(eval_json_path):
+                upload_file(drive, eval_json_path, folder_id)
+
+            # Get shareable link to evaluation card
+            eval_link = None
+            if eval_html:
+                eval_path = os.path.join(call_dir, "evaluation.html")
+                eval_link = get_shareable_link(drive, self.candidate_id, "evaluation.html", parent_name=FOLDER_NAME)
+
+            logger.info("Drive upload complete for %s: folder=%s", self.candidate_id, folder_id)
+            return eval_link
+
+        except Exception as e:
+            logger.warning("Drive upload failed for %s: %s", self.candidate_id, e)
+            return None
+
+    def _generate_eval_card(self, result: dict) -> str:
+        """Generate an HTML evaluation card."""
+        if not result:
+            return ""
+
+        candidate_name = self.candidate_name or self.username or "Candidate"
+        score = result.get("overall_score", 0)
+        pass_fail = "Passed" if score >= 70 else "Failed"
+        scores = result.get("scores", {})
+        strengths = result.get("strengths", [])
+        improvements = result.get("areas_for_improvement", [])
+        coaching = result.get("coaching", "")
+        lead_status = result.get("lead_status", "")
+        transcript = result.get("transcript", [])
+
+        transcript_html = ""
+        for m in transcript:
+            role = "SDR" if m.get("role") == "user" else "Customer"
+            text = m.get("text", "")
+            transcript_html += f'<p><strong>{role}:</strong> {text}</p>\n'
+
+        scores_html = ""
+        for cat, val in scores.items():
+            label = cat.replace("_", " ").title()
+            color = "#27ae60" if val >= 7 else ("#f39c12" if val >= 5 else "#e74c3c")
+            scores_html += f'<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #eee;"><span>{label}</span><span style="color:{color};font-weight:bold;">{val}/10</span></div>\n'
+
+        strengths_html = "".join(f"<li>{s}</li>" for s in strengths) if strengths else "<li>None identified</li>"
+        improvements_html = "".join(f"<li>{s}</li>" for s in improvements) if improvements else "<li>None identified</li>"
+
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Evaluation - {candidate_name}</title>
+<style>
+  body {{ font-family: Arial, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; color: #333; }}
+  .header {{ background: #2c3e50; color: white; padding: 1.5rem; border-radius: 8px 8px 0 0; }}
+  .header h1 {{ margin: 0 0 0.5rem 0; font-size: 1.5rem; }}
+  .header .meta {{ opacity: 0.9; font-size: 0.9rem; }}
+  .section {{ padding: 1.2rem; border: 1px solid #e0e0e0; border-top: none; }}
+  .section:last-child {{ border-radius: 0 0 8px 8px; }}
+  .score-big {{ font-size: 3rem; font-weight: bold; text-align: center; margin: 1rem 0; }}
+  .passed {{ color: #27ae60; }}
+  .failed {{ color: #e74c3c; }}
+  .category-bar {{ display: flex; align-items: center; gap: 0.5rem; }}
+  .bar {{ flex: 1; height: 8px; background: #eee; border-radius: 4px; }}
+  .bar-fill {{ height: 100%; border-radius: 4px; }}
+  .transcript {{ background: #f8f9fa; padding: 1rem; border-radius: 6px; max-height: 400px; overflow-y: auto; font-size: 0.9rem; }}
+  .transcript p {{ margin: 0.3rem 0; }}
+</style></head>
+<body>
+  <div class="header">
+    <h1>Evaluation Report</h1>
+    <div class="meta"><strong>{candidate_name}</strong> | Scenario: {self.scenario.get("name", "")} | Date: {datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")}</div>
+  </div>
+
+  <div class="section" style="text-align:center;">
+    <div class="score-big {"passed" if score >= 70 else "failed"}">{score}/100</div>
+    <div style="font-size:1.3rem;font-weight:bold;color:{"#27ae60" if score >= 70 else "#e74c3c"};">{pass_fail}</div>
+  </div>
+
+  <div class="section">
+    <h3>Scores by Category</h3>
+    {scores_html}
+  </div>
+
+  <div class="section">
+    <h3>Strengths</h3>
+    <ul>{strengths_html}</ul>
+  </div>
+
+  <div class="section">
+    <h3>Areas for Improvement</h3>
+    <ul>{improvements_html}</ul>
+  </div>
+
+  <div class="section">
+    <h3>Coaching Notes</h3>
+    <p>{coaching}</p>
+  </div>
+
+  <div class="section">
+    <h3>Lead Status: <span style="text-transform:uppercase;">{lead_status}</span></h3>
+  </div>
+
+  <div class="section">
+    <h3>Transcript</h3>
+    <div class="transcript">{transcript_html if transcript_html else "<p>No transcript available.</p>"}</div>
+  </div>
+</body>
+</html>"""
 
     async def _send_hiringflow_callback(self, result: dict) -> None:
         """Send evaluation result to HiringFlow webhook."""
