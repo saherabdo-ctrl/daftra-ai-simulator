@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -81,6 +82,8 @@ AGENT_NAME = os.getenv("AGENT_NAME", "sdr-training-agent")
 WEBHOOK_URL = os.getenv("EVALUATION_WEBHOOK_URL", "http://localhost:8000/api/results")
 WEBHOOK_SECRET = os.getenv("AGENT_WEBHOOK_SECRET", "")
 SCENARIOS_BASE_URL = os.getenv("SCENARIOS_BASE_URL", "http://localhost:8000").rstrip("/")
+HIRINGFLOW_WEBHOOK_URL = os.getenv("HIRINGFLOW_WEBHOOK_URL", "")
+HIRINGFLOW_WEBHOOK_SECRET = os.getenv("HIRINGFLOW_WEBHOOK_SECRET", "")
 
 # رصيد Groq المجاني محدود يوميًا؛ الأفضل إضافة GEMINI_API_KEY لرصيد مجاني أكبر بكثير.
 # الاحتياطي الافتراضي openai/gpt-oss-20b (نظيف بلا تسريب تفكير). متاح أيضًا: allam-2-7b، qwen/qwen3.6-27b
@@ -371,12 +374,17 @@ def _patch_recorder_mp3(session, output_path: str) -> None:
 
 
 class CustomerAgent(Agent):
-    def __init__(self, scenario: dict, room_name: str, room=None, username: str = "", industry: str = "") -> None:
+    def __init__(self, scenario: dict, room_name: str, room=None, username: str = "", industry: str = "", test_session_id: str = "", candidate_id: str = "", candidate_email: str = "", user_type: str = "INTERNAL", callback_url: str = "") -> None:
         self.scenario = scenario
         self.room_name = room_name
         self.room = room
         self.username = username
         self.industry = industry
+        self.test_session_id = test_session_id
+        self.candidate_id = candidate_id
+        self.candidate_email = candidate_email
+        self.user_type = user_type
+        self.callback_url = callback_url
         self.started_at = time.monotonic()
         self.transcript: list[dict] = []
         self._seen_ids: set = set()
@@ -480,7 +488,7 @@ class CustomerAgent(Agent):
                     "Evaluation ready for room %s: score=%.1f grade=%s — posting result",
                     self.room_name, result.get("score", 0.0), result.get("grade", "?"),
                 )
-                # حفظ التقييم في مجلد المكالمة
+                # Save evaluation to call directory
                 try:
                     call_dir = self._get_call_dir()
                     os.makedirs(call_dir, exist_ok=True)
@@ -489,10 +497,93 @@ class CustomerAgent(Agent):
                         json.dump(result, f, ensure_ascii=False, indent=2)
                 except Exception as e:
                     logger.warning("Failed to save evaluation: %s", e)
+
+                # Post result to local webhook (existing behavior)
                 await self._post_result(result)
+
+                # Handle candidate-specific post-call actions
+                if self.user_type == "CANDIDATE":
+                    await self._handle_candidate_completion(result)
+
+                # Send results to HiringFlow if callback_url is configured
+                if self.callback_url:
+                    await self._send_hiringflow_callback(result)
+
                 self._reported = True
         except Exception:
             logger.exception("Evaluation failed for room %s", self.room_name)
+
+    async def _handle_candidate_completion(self, result: dict) -> None:
+        """Handle candidate-specific completion: update status in Google Sheets."""
+        if not self.candidate_id:
+            return
+
+        try:
+            from sheets import get_sheets_client
+            sheets = get_sheets_client()
+
+            # Update status to ended
+            timestamp = datetime.utcnow().isoformat()
+            sheets.update_candidate_status(self.candidate_id, 'ended', timestamp)
+
+            # Update score and result
+            overall_score = result.get('overall_score', 0)
+            pass_result = 'PASSED' if overall_score >= 70 else 'REJECTED'
+            sheets.update_candidate_result(self.candidate_id, overall_score, pass_result)
+
+            logger.info("Candidate %s completion updated: score=%d, result=%s",
+                       self.candidate_id, overall_score, pass_result)
+
+        except Exception as e:
+            logger.warning("Failed to update candidate completion: %s", e)
+
+    async def _send_hiringflow_callback(self, result: dict) -> None:
+        """Send evaluation result to HiringFlow webhook."""
+        if not self.callback_url:
+            return
+
+        try:
+            # Find recording file
+            call_dir = self._get_call_dir()
+            recording_path = None
+            if os.path.exists(call_dir):
+                for f in os.listdir(call_dir):
+                    if f.endswith(".mp3"):
+                        recording_path = os.path.join(call_dir, f)
+                        break
+
+            # Prepare callback payload
+            payload = {
+                "session_id": self.room_name,
+                "candidate_id": self.candidate_id,
+                "candidate_name": self.username,
+                "scenario": self.scenario.get("id", ""),
+                "overall_score": result.get("overall_score", 0),
+                "scores": result.get("scores", {}),
+                "lead_status": result.get("lead_status", ""),
+                "coaching": result.get("coaching", ""),
+                "transcript": self.transcript,
+                "duration_seconds": result.get("duration_seconds", 0),
+                "completed_at": datetime.utcnow().isoformat(),
+                "recording_reference": recording_path,
+            }
+
+            # Send callback
+            headers = {"Content-Type": "application/json"}
+            if HIRINGFLOW_WEBHOOK_SECRET:
+                headers["Authorization"] = f"Bearer {HIRINGFLOW_WEBHOOK_SECRET}"
+
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(
+                    self.callback_url,
+                    json=payload,
+                    headers=headers
+                )
+                response.raise_for_status()
+                logger.info("HiringFlow callback sent: HTTP %s", response.status_code)
+
+        except Exception as e:
+            logger.warning("HiringFlow callback failed: %s", e)
 
     def record_item(self, item: Any) -> None:
         try:
@@ -585,9 +676,8 @@ class CustomerAgent(Agent):
 
 
 server = AgentServer(
-    job_executor=JobExecutorType.THREAD,
+    job_executor_type=JobExecutorType.THREAD,
     num_idle_processes=0,
-    prewarm_absent=True,
 )
 
 
@@ -599,14 +689,25 @@ async def entrypoint(ctx: JobContext) -> None:
     # استخراج بيانات المستخدم والنشاط من metadata
     username = ""
     industry = ""
+    test_session_id = ""
+    candidate_id = ""
+    candidate_email = ""
+    user_type = "INTERNAL"
+    callback_url = ""
     try:
         metadata = json.loads(ctx.job.metadata or "{}")
         username = metadata.get("username", "")
         industry = metadata.get("industry", "")
+        test_session_id = metadata.get("test_session_id", "")
+        candidate_id = metadata.get("candidate_id", "")
+        candidate_email = metadata.get("candidate_email", "")
+        user_type = metadata.get("user_type", "INTERNAL")
+        callback_url = metadata.get("callback_url", "")
     except Exception:
         pass
 
-    logger.info("Agent dispatched to %s for scenario %s (user=%s, industry=%s)", ctx.room.name, scenario["id"], username, industry)
+    logger.info("Agent dispatched to %s for scenario %s (user=%s, industry=%s, user_type=%s)",
+               ctx.room.name, scenario["id"], username, industry, user_type)
 
     # Load VAD lazily (no prewarm — avoids multiprocessing fork issues in cloud)
     vad = silero.VAD.load()
@@ -624,7 +725,13 @@ async def entrypoint(ctx: JobContext) -> None:
         ),
     )
 
-    agent = CustomerAgent(scenario, ctx.room.name, room=ctx.room, username=username, industry=industry)
+    agent = CustomerAgent(
+        scenario, ctx.room.name, room=ctx.room,
+        username=username, industry=industry,
+        test_session_id=test_session_id,
+        candidate_id=candidate_id, candidate_email=candidate_email,
+        user_type=user_type, callback_url=callback_url
+    )
 
     @session.on("conversation_item_added")
     def _on_item(item: Any) -> None:

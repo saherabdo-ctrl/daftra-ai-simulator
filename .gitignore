@@ -5,8 +5,13 @@ __pycache__/
 recordings/
 data/calls/
 data/users.json
-data/results/*.json
+keys/
+*.json
 !data/results/.gitkeep
-data/scenarios/*.json
 !data/scenarios/.gitkeep
+!.env.example
+data/results/*.json
+data/scenarios/*.json
 .DS_Store
+test_login.py
+*-*.json

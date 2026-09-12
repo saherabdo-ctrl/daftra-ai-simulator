@@ -19,7 +19,13 @@ const api = {
     const res = await fetch(path, { ...options, headers });
     if (res.status === 401) {
       setToken('');
-      renderLogin('انتهت الجلسة — سجّل الدخول مجددًا');
+      // Check if this is a candidate request
+      const candidateToken = localStorage.getItem('candidate_token');
+      if (candidateToken) {
+        renderCandidateLogin('Session expired — please login again');
+      } else {
+        renderLogin('انتهت الجلسة — سجّل الدخول مجددًا');
+      }
       throw new Error('Unauthorized');
     }
     if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
@@ -48,11 +54,11 @@ const api = {
   createCustom: (brief) => api.post('/api/scenarios/custom', brief),
   uploadCall: (file) => api.upload('/api/upload-call', file),
   randomCall: () => api.post('/api/random-call', {}),
-  getUsers: () => api.get('/api/users'),
-  createUser: (u) => api.post('/api/users', u),
-  deleteUser: (username) => api.del(`/api/users/${encodeURIComponent(username)}`),
-  bulkUsers: (names, baseUsername, role) =>
-    api.post('/api/users/bulk', { names, base_username: baseUsername, role }),
+  // Candidate endpoints
+  candidateLogin: (email, candidate_id) =>
+    api.post('/api/candidate/login', { email, candidate_id }),
+  candidateStartCall: () => api.post('/api/candidate/start-call', {}),
+  candidateStatus: () => api.get('/api/candidate/status'),
 };
 
 const app = document.getElementById('app');
@@ -95,28 +101,37 @@ function renderLogin(error = '') {
     <header class="topbar">
       <div class="topbar-inner">
         <span class="logo">🎙️</span>
-        <h1>معمل تدريب المبيعات</h1>
+        <h1>AI Simulator</h1>
       </div>
     </header>
     <main class="container">
       <div class="card login-card">
-        <h2>تسجيل الدخول</h2>
-        <p class="muted">استخدم حسابك المخصص (مندوب مبيعات / فريق الجودة / مدير).</p>
+        <h2>Internal User Login</h2>
+        <p class="muted">Enter your email and access code from the Heads sheet.</p>
         ${error ? `<div class="alert">${escapeHtml(error)}</div>` : ''}
         <form id="login-form" class="form-grid">
-          <label>اسم المستخدم
-            <input name="username" autocomplete="username" required />
+          <label>Email
+            <input name="username" type="email" autocomplete="email" required placeholder="e.g. user@company.com" />
           </label>
-          <label>كلمة المرور
-            <input name="password" type="password" autocomplete="current-password" required />
+          <label>Access Code
+            <input name="password" type="password" autocomplete="off" required placeholder="e.g. HF-XXXXXXXX" />
           </label>
-          <button type="submit" class="btn btn-primary full">🔐 دخول</button>
+          <button type="submit" class="btn btn-primary full">Login</button>
         </form>
+        <p class="muted small" style="margin-top: 1rem;">
+          <a href="#" id="switch-to-candidate">Login as candidate</a>
+        </p>
       </div>
     </main>`);
+
   document.getElementById('login-form').addEventListener('submit', (e) => {
     e.preventDefault();
     doLogin();
+  });
+
+  document.getElementById('switch-to-candidate').addEventListener('click', (e) => {
+    e.preventDefault();
+    renderCandidateLogin();
   });
 }
 
@@ -125,13 +140,15 @@ async function doLogin() {
   const username = form.elements.username.value.trim();
   const password = form.elements.password.value;
   try {
-    const res = await api.login(username, password);
+    const res = await api.post('/api/login', { username, password });
     setToken(res.token);
     user = res.user;
     await loadRoleData();
     renderLanding();
   } catch (err) {
-    renderLogin(`فشل تسجيل الدخول: ${err.message}`);
+    let msg = err.message || 'Unknown error';
+    if (msg.includes('401')) msg = 'Invalid credentials or inactive account';
+    renderLogin(`Login failed: ${msg}`);
   }
 }
 
@@ -1029,22 +1046,373 @@ function renderScorecard(result) {
   });
 }
 
-/* ---------------- الإقلاع ---------------- */
+/* ---------------- Candidate Functions ---------------- */
+
+const CANDIDATE_TOKEN_KEY = 'candidate_token';
+let candidate = null;
+let candidateStream = null;
+
+function getCandidateToken() {
+  return localStorage.getItem(CANDIDATE_TOKEN_KEY) || '';
+}
+
+function setCandidateToken(t) {
+  if (t) localStorage.setItem(CANDIDATE_TOKEN_KEY, t);
+  else localStorage.removeItem(CANDIDATE_TOKEN_KEY);
+}
+
+function renderCandidateLogin(error = '') {
+  render(`
+    <header class="topbar">
+      <div class="topbar-inner">
+        <span class="logo">🎙️</span>
+        <h1>AI Simulator - Test Call</h1>
+      </div>
+    </header>
+    <main class="container">
+      <div class="card login-card">
+        <h2>Candidate Login</h2>
+        <p class="muted">Enter your email and candidate ID to start your test call.</p>
+        ${error ? `<div class="alert">${escapeHtml(error)}</div>` : ''}
+        <form id="candidate-login-form" class="form-grid">
+          <label>Email
+            <input name="email" type="email" autocomplete="email" required placeholder="e.g. candidate@email.com" />
+          </label>
+          <label>Candidate ID
+            <input name="candidate_id" autocomplete="off" required placeholder="e.g. CAND-XXXXXXXX" />
+          </label>
+          <button type="submit" class="btn btn-primary full">Login</button>
+        </form>
+        <p class="muted small" style="margin-top: 1rem;">
+          <a href="#" id="switch-to-internal">Login as internal user</a>
+        </p>
+      </div>
+    </main>`);
+
+  document.getElementById('candidate-login-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    doCandidateLogin();
+  });
+
+  document.getElementById('switch-to-internal').addEventListener('click', (e) => {
+    e.preventDefault();
+    renderLogin();
+  });
+}
+
+async function doCandidateLogin() {
+  const form = document.getElementById('candidate-login-form');
+  const email = form.elements.email.value.trim();
+  const candidateId = form.elements.candidate_id.value.trim();
+
+  try {
+    const res = await api.post('/api/candidate/login', { email, candidate_id: candidateId });
+
+    if (res.status === 'ended') {
+      renderCandidateLogin(res.message || 'You already completed your test call.');
+      return;
+    }
+
+    if (res.status === 'started') {
+      renderCandidateLogin(res.message || 'Test call in progress.');
+      return;
+    }
+
+    setCandidateToken(res.token);
+    candidate = res.candidate;
+    renderCandidateReady();
+  } catch (err) {
+    let msg = err.message || 'Unknown error';
+    if (msg.includes('401')) msg = 'Invalid candidate credentials';
+    renderCandidateLogin(`Login failed: ${msg}`);
+  }
+}
+
+function renderCandidateReady(error = '') {
+  if (!candidate) {
+    renderCandidateLogin();
+    return;
+  }
+
+  render(`
+    <header class="topbar">
+      <div class="topbar-inner">
+        <span class="logo">🎙️</span>
+        <h1>AI Simulator - Test Call</h1>
+      </div>
+    </header>
+    <main class="container">
+      <div class="card login-card">
+        <h2>Welcome, ${escapeHtml(candidate.candidate_name)}</h2>
+        <p class="muted">Ready to start your test call?</p>
+        ${error ? `<div class="alert">${escapeHtml(error)}</div>` : ''}
+        <div id="camera-preview" style="margin: 1rem 0;">
+          <video id="preview-video" autoplay muted playsinline style="width: 100%; max-width: 400px; border-radius: 8px; background: #000;"></video>
+        </div>
+        <div id="device-status"></div>
+        <button id="start-call-btn" class="btn btn-primary full" disabled>Start Test Call</button>
+        <button id="logout-btn" class="btn btn-ghost full" style="margin-top: 0.5rem;">Logout</button>
+      </div>
+    </main>`);
+
+  document.getElementById('logout-btn').addEventListener('click', candidateLogout);
+  document.getElementById('start-call-btn').addEventListener('click', startCandidateCall);
+
+  checkCameraAndMic();
+}
+
+async function checkCameraAndMic() {
+  const video = document.getElementById('preview-video');
+  const status = document.getElementById('device-status');
+  const startBtn = document.getElementById('start-call-btn');
+
+  try {
+    candidateStream = await navigator.mediaDevices.getUserMedia({
+      video: true,
+      audio: true
+    });
+
+    video.srcObject = candidateStream;
+    status.innerHTML = '<p style="color: green;">✓ Camera and microphone ready</p>';
+    startBtn.disabled = false;
+
+  } catch (err) {
+    let message = '';
+    if (err.name === 'NotAllowedError') {
+      message = 'Camera and microphone access are required to start your Test Call.';
+    } else if (err.name === 'NotFoundError') {
+      message = 'No camera or microphone detected. Please connect a camera and microphone.';
+    } else {
+      message = 'Camera and microphone access are required to start your Test Call.';
+    }
+
+    status.innerHTML = `<p style="color: red;">${message}</p>`;
+    startBtn.disabled = true;
+  }
+}
+
+async function startCandidateCall() {
+  if (!candidate) return;
+
+  const startBtn = document.getElementById('start-call-btn');
+  startBtn.disabled = true;
+  startBtn.textContent = 'Starting...';
+
+  try {
+    const res = await api.candidateStartCall();
+    renderCandidateCall(res);
+  } catch (err) {
+    startBtn.disabled = false;
+    startBtn.textContent = 'Start Test Call';
+    renderCandidateReady(`Failed to start call: ${err.message}`);
+  }
+}
+
+function renderCandidateCall(credentials) {
+  render(`
+    <header class="topbar">
+      <div class="topbar-inner">
+        <span class="logo">🎙️</span>
+        <h1>AI Simulator - Test Call</h1>
+      </div>
+    </header>
+    <main class="container call-screen">
+      <div class="card call-card">
+        <div class="call-header">
+          <div class="avatar">ع</div>
+          <div>
+            <h2>Test Call</h2>
+            <p class="muted small">${escapeHtml(credentials.scenario || '')}</p>
+          </div>
+          <div class="call-meta">
+            <div><span class="dot dot-live"></span> Live</div>
+            <div>⏱ <span id="call-duration">00:00</span></div>
+          </div>
+        </div>
+        <p id="call-status" class="status">Connecting...</p>
+        <div class="meter-wrap" title="Customer audio">
+          <div class="meter" id="audio-meter"></div>
+        </div>
+        <div class="call-controls">
+          <button id="btn-mute" class="btn btn-ghost">🎤 Microphone On</button>
+          <button id="btn-end" class="btn btn-danger">📞 End Call</button>
+        </div>
+      </div>
+    </main>`);
+
+  // Connect to LiveKit
+  connectCandidateCall(credentials);
+}
+
+async function connectCandidateCall(credentials) {
+  agentJoined = false;
+  audioSubscribed = false;
+  room = new Room();
+
+  room.on(RoomEvent.ParticipantConnected, () => {
+    agentJoined = true;
+    updateCallStatus();
+  });
+
+  room.on(RoomEvent.TrackSubscribed, (track) => {
+    if (track.kind === 'audio') {
+      audioSubscribed = true;
+      forcePlayTrack(track);
+      attachMeter(track);
+      room.startAudio().catch(() => {});
+    }
+    updateCallStatus();
+  });
+
+  room.on(RoomEvent.TrackMuted, updateMicUI);
+  room.on(RoomEvent.TrackUnmuted, updateMicUI);
+  room.on(RoomEvent.Disconnected, onCandidateDisconnected);
+
+  // Ring tone
+  room.on(RoomEvent.DataReceived, (payload, participant, kind, topic) => {
+    try {
+      const text = typeof payload === 'string' ? payload : new TextDecoder().decode(payload);
+      if (text && text.includes('"ring"')) {
+        const ringAudio = new Audio('/static/ring.wav');
+        ringAudio.volume = 0.8;
+        ringAudio.play().catch(() => {});
+      }
+    } catch (_) {}
+  });
+
+  try {
+    await room.connect(credentials.url, credentials.token);
+    await room.localParticipant.setMicrophoneEnabled(true);
+
+    // Enable camera if available
+    if (candidateStream) {
+      const videoTrack = candidateStream.getVideoTracks()[0];
+      if (videoTrack) {
+        await room.localParticipant.publishTrack(videoTrack);
+      }
+    }
+
+    if (room.remoteParticipants.size > 0) agentJoined = true;
+    try {
+      await room.startAudio();
+    } catch (_) {}
+
+    current = { scenario: { id: credentials.scenario }, credentials, startedAt: Date.now(), timer: null };
+    startTimer();
+    updateCallStatus();
+    updateMicUI();
+
+    document.getElementById('btn-mute').addEventListener('click', toggleMute);
+    document.getElementById('btn-end').addEventListener('click', endCandidateCall);
+
+    setTimeout(() => {
+      if (!agentJoined && room) {
+        setStatus('Waiting for agent...');
+      }
+    }, 20000);
+  } catch (err) {
+    try { room.disconnect(); } catch (_) {}
+    renderCandidateReady(`Connection failed: ${err.message}`);
+  }
+}
+
+function onCandidateDisconnected() {
+  if (meterTimer) {
+    clearInterval(meterTimer);
+    meterTimer = null;
+  }
+  if (room) {
+    room.removeAllListeners();
+    room = null;
+  }
+}
+
+function endCandidateCall() {
+  stopTimer();
+  if (room) {
+    try { room.disconnect(); } catch (_) {}
+  }
+  renderCandidateCompletion();
+}
+
+function renderCandidateCompletion() {
+  // Stop camera stream
+  if (candidateStream) {
+    candidateStream.getTracks().forEach(track => track.stop());
+    candidateStream = null;
+  }
+
+  // Clear candidate session
+  setCandidateToken('');
+  candidate = null;
+
+  render(`
+    <header class="topbar">
+      <div class="topbar-inner">
+        <span class="logo">🎙️</span>
+        <h1>AI Simulator - Test Call</h1>
+      </div>
+    </header>
+    <main class="container center">
+      <div class="card call-card">
+        <h2>✅ You finished your test call successfully.</h2>
+        <p class="muted">You may close this window.</p>
+      </div>
+    </main>`);
+}
+
+function candidateLogout() {
+  // Stop camera stream
+  if (candidateStream) {
+    candidateStream.getTracks().forEach(track => track.stop());
+    candidateStream = null;
+  }
+
+  setCandidateToken('');
+  candidate = null;
+  renderCandidateLogin();
+}
+
+/* ---------------- Boot ---------------- */
 
 async function boot() {
-  if (!getToken()) {
-    renderLogin();
-    return;
+  // Check for candidate token first
+  const candidateToken = getCandidateToken();
+  if (candidateToken) {
+    try {
+      const res = await api.get('/api/candidate/status');
+      candidate = {
+        candidate_id: res.candidate_id,
+        candidate_name: res.candidate_name,
+        scenario: res.scenario,
+      };
+      if (res.status === 'pending') {
+        renderCandidateReady();
+      } else {
+        renderCandidateCompletion();
+      }
+      return;
+    } catch (_) {
+      setCandidateToken('');
+    }
   }
-  try {
-    const meRes = await api.me();
-    user = meRes.user;
-    await loadRoleData();
-  } catch (_) {
-    renderLogin();
-    return;
+
+  // Check for internal user token
+  const internalToken = getToken();
+  if (internalToken) {
+    try {
+      const meRes = await api.get('/api/me');
+      user = meRes.user;
+      await loadRoleData();
+      renderLanding();
+      return;
+    } catch (_) {
+      setToken('');
+    }
   }
-  renderLanding();
+
+  // Default: show internal login (with link to candidate login)
+  renderLogin();
 }
 
 boot();

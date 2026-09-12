@@ -12,6 +12,8 @@ import random
 import secrets
 import sys
 import time
+import uuid
+from datetime import datetime
 from pathlib import Path
 
 # Ensure UTF-8 output on all platforms (Windows cp1252 crashes on Arabic)
@@ -42,6 +44,7 @@ LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "").strip()
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "").strip()
 AGENT_NAME = os.getenv("AGENT_NAME", "sdr-training-agent")
 WEBHOOK_SECRET = os.getenv("AGENT_WEBHOOK_SECRET", "")
+HIRINGFLOW_API_KEY = os.getenv("HIRINGFLOW_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "8000"))
 
 # Validate LiveKit configuration at startup
@@ -71,8 +74,6 @@ else:
 
 app = FastAPI(title="SDR AI Training Lab")
 
-auth.seed()
-
 _results: dict[str, dict] = {}
 _custom_briefs: dict[str, dict] = {}
 
@@ -88,6 +89,13 @@ for f in SCENARIOS_DIR.glob("*.json"):
 
 class TokenRequest(BaseModel):
     scenario: str = "new-lead-discovery-call"
+
+
+class StartSessionRequest(BaseModel):
+    test_session_id: str
+    candidate_name: str
+    queue: str = "SDR"
+    scenario_id: str = ""
 
 
 class CustomScenarioRequest(BaseModel):
@@ -115,17 +123,13 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class UserRequest(BaseModel):
-    username: str
-    name: str = ""
-    role: str = "sdr"
-    password: str = ""
+class CandidateLoginRequest(BaseModel):
+    email: str
+    candidate_id: str
 
 
-class BulkUsersRequest(BaseModel):
-    base_username: str = "sdr"
-    names: list[str]
-    role: str = "sdr"
+class CandidateStartCallRequest(BaseModel):
+    pass  # No body needed - candidate identity from JWT
 
 
 def _scenario_exists(scenario_id: str) -> bool:
@@ -159,6 +163,16 @@ def require_user_or_service(authorization: str = Header(None)) -> dict:
     return user
 
 
+def require_hiringflow_api_key(authorization: str = Header(None)) -> bool:
+    """Validate HiringFlow API key for /api/start-session endpoint."""
+    token = authorization[7:] if authorization and authorization.startswith("Bearer ") else ""
+    if not HIRINGFLOW_API_KEY:
+        raise HTTPException(status_code=500, detail="HIRINGFLOW_API_KEY not configured")
+    if token != HIRINGFLOW_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return True
+
+
 def _all_scenario_summaries() -> list[dict]:
     scenarios = personas.scenarios_summary()
     for brief in _custom_briefs.values():
@@ -166,58 +180,249 @@ def _all_scenario_summaries() -> list[dict]:
     return scenarios
 
 
+class CandidateLoginRequest(BaseModel):
+    email: str
+    candidate_id: str
+
+
+class CandidateStartCallRequest(BaseModel):
+    pass  # No body needed - candidate identity from JWT
+
+
 @app.post("/api/login")
 async def login(req: LoginRequest) -> dict:
-    result = auth.authenticate(req.username.strip(), req.password)
-    if not result:
-        raise HTTPException(status_code=401, detail="اسم المستخدم أو كلمة المرور غير صحيحة")
-    return result
+    """Internal user login using Google Sheets Heads tab."""
+    print(f"[LOGIN] Attempt: username={req.username!r}")
+    try:
+        result = auth.authenticate_internal(req.username.strip(), req.password)
+        if result:
+            print(f"[LOGIN] Success: user={result['user']['name']}, role={result['user']['role']}")
+            return result
+        print(f"[LOGIN] FAILED: authenticate_internal returned None")
+        raise HTTPException(status_code=401, detail="Invalid credentials or inactive account")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[LOGIN] EXCEPTION: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Login error: {type(e).__name__}: {str(e)[:200]}")
+
+
+# =============================================================================
+# Candidate Endpoints (Test Call Only)
+# =============================================================================
+
+@app.post("/api/candidate/login")
+async def candidate_login(req: CandidateLoginRequest) -> dict:
+    """Candidate login using Google Sheets Candidates tab.
+
+    CandidateID IS the access code.
+    """
+    print(f"[CANDIDATE LOGIN] Attempt: email={req.email!r}, candidate_id={req.candidate_id!r}")
+    try:
+        result = auth.authenticate_candidate(req.email.strip(), req.candidate_id.strip())
+        if result:
+            print(f"[CANDIDATE LOGIN] Success: status={result.get('status', 'pending')}")
+            return result
+        print(f"[CANDIDATE LOGIN] FAILED: authenticate_candidate returned None")
+        raise HTTPException(status_code=401, detail="Invalid candidate credentials")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[CANDIDATE LOGIN] EXCEPTION: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Login error: {type(e).__name__}: {str(e)[:200]}")
+
+
+@app.post("/api/candidate/start-call")
+async def candidate_start_call(request: Request) -> dict:
+    """Start test call for candidate.
+
+    Requires Candidate JWT.
+    Transitions status: pending → started
+    """
+    # Extract and validate candidate from JWT
+    auth_header = request.headers.get('Authorization', '')
+    token = auth_header[7:] if auth_header.startswith('Bearer ') else ''
+    payload = auth.user_from_token(token)
+
+    if not payload or payload.get('user_type') != 'CANDIDATE':
+        raise HTTPException(status_code=401, detail="Candidate authentication required")
+
+    candidate_id = payload.get('candidate_id')
+    if not candidate_id:
+        raise HTTPException(status_code=400, detail="Invalid candidate token")
+
+    # Get current candidate status from Google Sheets
+    try:
+        from sheets import get_sheets_client
+        sheets = get_sheets_client()
+
+        # Verify current status
+        candidate = sheets.get_candidate(
+            payload.get('email', ''),
+            candidate_id
+        )
+
+        if not candidate:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+
+        current_status = candidate.get('test_call_status', 'pending')
+
+        # Check if call can be started
+        if current_status != 'pending':
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot start call: status is {current_status}"
+            )
+
+        # Update status to started (with timestamp)
+        timestamp = datetime.utcnow().isoformat()
+        sheets.update_candidate_status(candidate_id, 'started', timestamp)
+
+        # Generate LiveKit token
+        scenario = candidate.get('scenario', 'new-lead-discovery-call')
+        room = f"{scenario}_{candidate_id}"
+        identity = f"sdr_{uuid.uuid4().hex[:4]}"
+
+        metadata = json.dumps({
+            "scenario": scenario,
+            "username": candidate.get('candidate_name', ''),
+            "industry": "",
+            "candidate_id": candidate_id,
+            "candidate_name": candidate.get('candidate_name', ''),
+            "candidate_email": candidate.get('candidate_email', ''),
+            "user_type": "CANDIDATE",
+            "callback_url": os.getenv('HIRINGFLOW_WEBHOOK_URL', ''),
+        })
+
+        token_obj = (
+            AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+            .with_identity(identity)
+            .with_grants(VideoGrants(room_join=True, room=room))
+            .with_room_config(
+                RoomConfiguration(
+                    agents=[
+                        RoomAgentDispatch(
+                            agent_name=AGENT_NAME,
+                            metadata=metadata,
+                        )
+                    ]
+                )
+            )
+            .to_jwt()
+        )
+
+        return {
+            "url": LIVEKIT_URL,
+            "token": token_obj,
+            "room": room,
+            "session_id": room,
+            "scenario": scenario,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start call: {str(e)}")
+
+
+@app.get("/api/candidate/status")
+async def candidate_status(request: Request) -> dict:
+    """Get candidate test call status.
+
+    Requires Candidate JWT.
+    """
+    auth_header = request.headers.get('Authorization', '')
+    token = auth_header[7:] if auth_header.startswith('Bearer ') else ''
+    payload = auth.user_from_token(token)
+
+    if not payload or payload.get('user_type') != 'CANDIDATE':
+        raise HTTPException(status_code=401, detail="Candidate authentication required")
+
+    candidate_id = payload.get('candidate_id')
+    if not candidate_id:
+        raise HTTPException(status_code=400, detail="Invalid candidate token")
+
+    try:
+        from sheets import get_sheets_client
+        sheets = get_sheets_client()
+
+        candidate = sheets.get_candidate(
+            payload.get('email', ''),
+            candidate_id
+        )
+
+        if not candidate:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+
+        return {
+            "candidate_id": candidate['candidate_id'],
+            "candidate_name": candidate['candidate_name'],
+            "scenario": candidate['scenario'],
+            "status": candidate.get('test_call_status', 'pending'),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get status: {str(e)}")
+
+
+@app.post("/api/candidates/{candidate_id}/regenerate")
+async def regenerate_candidate(
+    candidate_id: str,
+    request: Request,
+    body: dict
+) -> dict:
+    """Regenerate test call link for candidate.
+
+    Requires ADMIN, TA_MANAGER, or TA_TEAM_LEADER role.
+    """
+    # Extract and validate internal user from JWT
+    auth_header = request.headers.get('Authorization', '')
+    token = auth_header[7:] if auth_header.startswith('Bearer ') else ''
+    payload = auth.user_from_token(token)
+
+    if not payload or payload.get('user_type') != 'INTERNAL':
+        raise HTTPException(status_code=401, detail="Internal user authentication required")
+
+    role = payload.get('role', '')
+    allowed_roles = ['ADMIN', 'TA_MANAGER', 'TA_TEAM_LEADER']
+    if role not in allowed_roles:
+        raise HTTPException(
+            status_code=403,
+            detail="Insufficient permissions for regeneration"
+        )
+
+    try:
+        from sheets import get_sheets_client
+        sheets = get_sheets_client()
+
+        new_candidate = sheets.increment_regeneration(candidate_id)
+        if not new_candidate:
+            raise HTTPException(status_code=404, detail=f"Candidate {candidate_id} not found")
+
+        return {
+            "candidate_id": new_candidate['candidate_id'],
+            "access_code": new_candidate['candidate_id'],  # CandidateID IS access code
+            "status": new_candidate['status'],
+            "attempt_number": new_candidate['attempt_number'],
+            "regeneration_count": new_candidate['regeneration_count'],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to regenerate: {str(e)}")
 
 
 @app.post("/api/logout")
 async def logout(authorization: str = Header(None)) -> dict:
-    token = authorization[7:] if authorization and authorization.startswith("Bearer ") else ""
-    auth.logout(token)
     return {"ok": True}
 
 
 @app.get("/api/me")
 async def me(user: dict = Depends(require_user)) -> dict:
     return {"user": user}
-
-
-@app.get("/api/users")
-async def list_users(user: dict = Depends(require_admin)) -> dict:
-    return {"users": auth.list_users()}
-
-
-@app.post("/api/users")
-async def create_user(req: UserRequest, user: dict = Depends(require_admin)) -> dict:
-    if not req.username.strip() or not req.password:
-        raise HTTPException(status_code=400, detail="اسم المستخدم وكلمة المرور مطلوبان")
-    created = auth.upsert_user(req.username, req.name, req.role, req.password)
-    if not created:
-        raise HTTPException(status_code=400, detail="اسم مستخدم غير صالح")
-    return {"user": created}
-
-
-@app.post("/api/users/bulk")
-async def create_users_bulk(req: BulkUsersRequest, user: dict = Depends(require_admin)) -> dict:
-    """ينشئ عدة حسابات دفعة واحدة ويرجع الاعتمادات (كلمة المرور تظهر مرة واحدة فقط)."""
-    base = req.base_username.strip() or "sdr"
-    if not req.names:
-        raise HTTPException(status_code=400, detail="أدخل أسماء المستخدمين (كل اسم في سطر)")
-    created = auth.generate_credentials(base, req.names, req.role)
-    if not created:
-        raise HTTPException(status_code=400, detail="لم تُنشأ أي حسابات")
-    return {"users": created}
-
-
-@app.delete("/api/users/{username}")
-async def delete_user(username: str, user: dict = Depends(require_admin)) -> dict:
-    if not auth.delete_user(username):
-        raise HTTPException(status_code=400, detail="لا يمكن حذف هذا المستخدم")
-    return {"ok": True}
 
 
 @app.post("/api/token")
@@ -258,6 +463,82 @@ async def create_token(req: TokenRequest, user: dict = Depends(require_user)) ->
         .to_jwt()
     )
     return {"url": LIVEKIT_URL, "token": token, "room": room, "scenario": req.scenario}
+
+
+@app.post("/api/start-session")
+async def start_session(req: StartSessionRequest, _auth: bool = Depends(require_hiringflow_api_key)) -> dict:
+    """Start a test session for a HiringFlow candidate.
+
+    Generates a LiveKit token and returns it for the candidate to join the call.
+    Requires Authorization: Bearer {HIRINGFLOW_API_KEY} header.
+    """
+    if not LIVEKIT_URL or not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
+        raise HTTPException(status_code=500, detail="LiveKit credentials not configured")
+
+    # Determine scenario: use provided scenario_id or default based on queue
+    scenario_id = req.scenario_id
+    if not scenario_id:
+        scenario_id = "new-lead-discovery-call" if req.queue == "SDR" else "lead-follow-up-call"
+
+    if not _scenario_exists(scenario_id):
+        # Try fallback to first available scenario
+        available = list(personas.SCENARIOS.keys())
+        if available:
+            scenario_id = available[0]
+        else:
+            raise HTTPException(status_code=400, detail=f"Scenario not found: {req.scenario_id}")
+
+    # Get scenario data
+    scenario_data = {}
+    try:
+        scenario_data = json.loads((SCENARIOS_DIR / f"{scenario_id}.json").read_text(encoding="utf-8"))
+    except Exception:
+        pass
+
+    # Generate room and token
+    room = f"{scenario_id}_{secrets.token_hex(6)}"
+    identity = f"sdr_{secrets.token_hex(4)}"
+    metadata = json.dumps({
+        "scenario": scenario_id,
+        "username": req.candidate_name,
+        "industry": scenario_data.get("business_field", ""),
+        "test_session_id": req.test_session_id,
+    })
+
+    token = (
+        AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+        .with_identity(identity)
+        .with_grants(VideoGrants(room_join=True, room=room))
+        .with_room_config(
+            RoomConfiguration(
+                agents=[
+                    RoomAgentDispatch(
+                        agent_name=AGENT_NAME,
+                        metadata=metadata,
+                    )
+                ]
+            )
+        )
+        .to_jwt()
+    )
+
+    scenario_summary = {}
+    try:
+        all_scenarios = _all_scenario_summaries()
+        for s in all_scenarios:
+            if s.get("id") == scenario_id:
+                scenario_summary = s
+                break
+    except Exception:
+        pass
+
+    return {
+        "test_session_id": req.test_session_id,
+        "livekit_url": LIVEKIT_URL,
+        "livekit_token": token,
+        "room": room,
+        "scenario": scenario_summary or {"id": scenario_id, "name": scenario_id},
+    }
 
 
 @app.get("/api/scenarios")
@@ -398,6 +679,35 @@ async def no_cache_static(request, call_next):
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/api/diagnostic")
+async def diagnostic() -> dict:
+    """Local-only diagnostic endpoint. Reports configuration status without exposing secrets."""
+    import os.path
+    result = {
+        "google_sheets_configured": bool(os.getenv("GOOGLE_SHEET_ID")),
+        "google_credentials_loaded": False,
+        "google_sheet_accessible": False,
+        "heads_tab_found": False,
+        "candidates_tab_found": False,
+        "jwt_secret_configured": bool(os.getenv("JWT_SECRET")),
+    }
+    try:
+        creds_path = os.getenv("GOOGLE_CREDENTIALS", "")
+        result["google_credentials_loaded"] = os.path.exists(creds_path)
+    except Exception:
+        pass
+    try:
+        from sheets import get_sheets_client
+        client = get_sheets_client()
+        result["google_sheet_accessible"] = True
+        tabs = [ws.title for ws in client.sheet.worksheets()]
+        result["heads_tab_found"] = "Heads" in tabs
+        result["candidates_tab_found"] = "Candidates" in tabs
+    except Exception as e:
+        result["google_sheets_error"] = str(e)[:200]
+    return result
 
 
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
