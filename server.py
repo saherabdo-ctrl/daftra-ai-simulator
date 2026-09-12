@@ -268,7 +268,7 @@ async def candidate_start_call(request: Request) -> dict:
         current_status = candidate.get('test_call_status', 'pending')
 
         # Check if call can be started
-        if current_status != 'pending':
+        if current_status not in ('pending', 'LINK_SENT'):
             raise HTTPException(
                 status_code=400,
                 detail=f"Cannot start call: status is {current_status}"

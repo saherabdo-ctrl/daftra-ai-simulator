@@ -1,10 +1,11 @@
 import { Room, RoomEvent } from 'livekit-client';
 
 const TOKEN_KEY = 'sdr_token';
+const CANDIDATE_TOKEN_KEY = 'candidate_token';
 const ROLE_LABELS = { sdr: 'مندوب مبيعات', quality: 'فريق الجودة', admin: 'مدير' };
 
 function getToken() {
-  return localStorage.getItem(TOKEN_KEY) || '';
+  return localStorage.getItem(TOKEN_KEY) || localStorage.getItem(CANDIDATE_TOKEN_KEY) || '';
 }
 function setToken(t) {
   if (t) localStorage.setItem(TOKEN_KEY, t);
@@ -18,9 +19,9 @@ const api = {
     if (token) headers['Authorization'] = `Bearer ${token}`;
     const res = await fetch(path, { ...options, headers });
     if (res.status === 401) {
+      const candidateToken = localStorage.getItem(CANDIDATE_TOKEN_KEY);
       setToken('');
-      // Check if this is a candidate request
-      const candidateToken = localStorage.getItem('candidate_token');
+      setCandidateToken('');
       if (candidateToken) {
         renderCandidateLogin('Session expired — please login again');
       } else {
@@ -1048,7 +1049,6 @@ function renderScorecard(result) {
 
 /* ---------------- Candidate Functions ---------------- */
 
-const CANDIDATE_TOKEN_KEY = 'candidate_token';
 let candidate = null;
 let candidateStream = null;
 
