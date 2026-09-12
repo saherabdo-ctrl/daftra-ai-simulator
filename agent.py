@@ -13,7 +13,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
@@ -550,31 +550,32 @@ class CustomerAgent(Agent):
         if not self.candidate_id:
             return
 
+        # Step 1: Update sheet (score, result, status) — must succeed
         try:
             from sheets import get_sheets_client
             sheets = get_sheets_client()
 
-            # Update status to ended
-            timestamp = datetime.now(timezone.utc).isoformat()
+            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             sheets.update_candidate_status(self.candidate_id, 'ended', timestamp)
 
-            # Update score and result
             overall_score = result.get('overall_score', 0) if result else 0
             pass_result = 'Passed' if overall_score >= 70 else 'Failed'
             sheets.update_candidate_result(self.candidate_id, overall_score, pass_result)
 
-            # Upload to Google Drive and get evaluation link
-            eval_link = await self._upload_to_drive(result)
+            logger.info("Candidate %s sheet updated: score=%d, result=%s",
+                       self.candidate_id, overall_score, pass_result)
+        except Exception as e:
+            logger.warning("Failed to update candidate sheet: %s", e)
+            return
 
-            # Update evaluation link in sheet (column X)
+        # Step 2: Upload to Drive + write evaluation link — best effort
+        try:
+            eval_link = await self._upload_to_drive(result)
             if eval_link:
                 sheets.update_candidate_evaluation(self.candidate_id, eval_link)
-
-            logger.info("Candidate %s completion updated: score=%d, result=%s, eval_link=%s",
-                       self.candidate_id, overall_score, pass_result, eval_link or 'none')
-
+                logger.info("Candidate %s evaluation link written: %s", self.candidate_id, eval_link)
         except Exception as e:
-            logger.warning("Failed to update candidate completion: %s", e)
+            logger.warning("Drive upload/eval link failed for %s: %s", self.candidate_id, e)
 
     async def _upload_to_drive(self, result: dict) -> Optional[str]:
         """Upload recording + evaluation to Google Drive in candidate subfolder.
@@ -699,7 +700,7 @@ class CustomerAgent(Agent):
 <body>
   <div class="header">
     <h1>Evaluation Report</h1>
-    <div class="meta"><strong>{candidate_name}</strong> | Scenario: {self.scenario.get("name", "")} | Date: {datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")}</div>
+    <div class="meta"><strong>{candidate_name}</strong> | Scenario: {self.scenario.get("name", "")} | Date: {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}</div>
   </div>
 
   <div class="section" style="text-align:center;">
@@ -765,7 +766,7 @@ class CustomerAgent(Agent):
                 "coaching": result.get("coaching", ""),
                 "transcript": self.transcript,
                 "duration_seconds": result.get("duration_seconds", 0),
-                "completed_at": datetime.utcnow().isoformat(),
+                "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                 "recording_reference": recording_path,
             }
 

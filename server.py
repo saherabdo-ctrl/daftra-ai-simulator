@@ -278,7 +278,7 @@ async def candidate_start_call(request: Request) -> dict:
             )
 
         # Update status to started (with timestamp)
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         sheets.update_candidate_status(candidate_id, 'started', timestamp)
 
         # Generate LiveKit token
@@ -351,7 +351,7 @@ async def candidate_end_call(request: Request) -> dict:
         from sheets import get_sheets_client
         sheets = get_sheets_client()
 
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         sheets.update_candidate_status(candidate_id, 'ended', timestamp)
 
         logger.info("Candidate %s end-call: status=ended, timestamp=%s", candidate_id, timestamp)
