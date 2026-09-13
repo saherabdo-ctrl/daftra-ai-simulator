@@ -1,4 +1,4 @@
-"""الخادم الخلفي لمعمل تدريب المبيعات (SDR AI Training Lab).
+"""الخادم الخلفي لـ DaftraAI-Simulator.
 
 يقدّم لوحة التحكم، ويصدر رموز LiveKit (مع إرسال العميل الآلي تلقائيًا)،
 ويخزّن/يعيد نتائج التقييم المرسلة من العميل الآلي.
@@ -45,7 +45,7 @@ CALLS_DIR = BASE_DIR / "data" / "calls"
 LIVEKIT_URL = os.getenv("LIVEKIT_URL", "").strip()
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "").strip()
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "").strip()
-AGENT_NAME = os.getenv("AGENT_NAME", "sdr-training-agent")
+AGENT_NAME = os.getenv("AGENT_NAME", "daftra-ai-simulator")
 WEBHOOK_SECRET = os.getenv("AGENT_WEBHOOK_SECRET", "")
 HIRINGFLOW_API_KEY = os.getenv("HIRINGFLOW_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "8000"))
@@ -75,7 +75,7 @@ if _livekit_errors:
 else:
     print("[server] LiveKit configuration validated ✓")
 
-app = FastAPI(title="SDR AI Training Lab")
+app = FastAPI(title="DaftraAI-Simulator")
 
 _results: dict[str, dict] = {}
 _custom_briefs: dict[str, dict] = {}
@@ -747,6 +747,24 @@ async def diagnostic() -> dict:
     except Exception as e:
         result["google_sheets_error"] = str(e)[:200]
     return result
+
+
+@app.get("/api/get-webhook-url")
+async def get_webhook_url() -> dict:
+    """Return the HiringFlow webhook URL from environment or Apps Script."""
+    url = os.getenv("HIRINGFLOW_WEBHOOK_URL", "")
+    if not url:
+        apps_script_url = os.getenv("HIRINGFLOW_APPSCRIPT_URL", "")
+        if apps_script_url:
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=10) as client:
+                    resp = await client.get(apps_script_url, params={"action": "getWebhookUrl"})
+                    data = resp.json()
+                    url = data.get("webhook_url", "")
+            except Exception:
+                pass
+    return {"webhook_url": url}
 
 
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")

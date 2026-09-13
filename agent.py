@@ -3,9 +3,9 @@
 Run with:  python agent.py dev
 
 The agent connects to the LiveKit project configured in .env as a worker. When
-an SDR connects to a room whose token dispatches the agent (AGENT_NAME), the
+a candidate connects to a room whose token dispatches the agent (AGENT_NAME), the
 agent joins, plays the customer persona in real time, and after the call ends
-it evaluates the SDR's performance and posts the result to the web server.
+it evaluates the candidate's performance and posts the result to the web server.
 """
 
 import asyncio
@@ -78,7 +78,7 @@ def _validate_env():
 
 _validate_env()
 
-AGENT_NAME = os.getenv("AGENT_NAME", "sdr-training-agent")
+AGENT_NAME = os.getenv("AGENT_NAME", "daftra-ai-simulator")
 WEBHOOK_URL = os.getenv("EVALUATION_WEBHOOK_URL", "http://localhost:8000/api/results")
 WEBHOOK_SECRET = os.getenv("AGENT_WEBHOOK_SECRET", "")
 SCENARIOS_BASE_URL = os.getenv("SCENARIOS_BASE_URL", "http://localhost:8000").rstrip("/")

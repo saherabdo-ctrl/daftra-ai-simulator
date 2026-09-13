@@ -1,5 +1,5 @@
 # ============================================================
-#  HiringFlow AI Simulator — Docker Compose (Local Testing)
+#  DaftraAI-Simulator — Docker Compose (Local Testing)
 #
 #  Usage:
 #    cp .env.example .env

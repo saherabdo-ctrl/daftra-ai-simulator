@@ -1,6 +1,6 @@
 @echo off
 rem ============================================================
-rem  SDR AI Training Lab - PUBLIC one-click launcher
+rem  DaftraAI-Simulator - PUBLIC one-click launcher
 rem  Same as start.bat, PLUS a persistent cloudflared tunnel so
 rem  your users can reach the app over HTTPS from anywhere.
 rem  MODE: LOCAL + tunnel (needs this machine ON). Runs
@@ -10,7 +10,7 @@ cd /d "%~dp0"
 
 rem Local agents use a distinct name so they never
 rem steal calls meant for the hosted (Serv00) agent.
-set AGENT_NAME=sdr-training-agent-local
+set AGENT_NAME=daftra-ai-simulator-local
 
 if not exist ".venv\Scripts\activate.bat" (
     echo [ERROR] .venv not found. Run setup first:
@@ -29,12 +29,12 @@ if errorlevel 1 (
     exit /b 1
 )
 
-start "SDR AI Training Lab - Agent" cmd /k ".\.venv\Scripts\activate.bat && python agent.py dev"
-start "SDR AI Training Lab - Server" cmd /k ".\.venv\Scripts\activate.bat && python server.py"
+start "DaftraAI-Simulator - Agent" cmd /k ".\.venv\Scripts\activate.bat && python agent.py dev"
+start "DaftraAI-Simulator - Server" cmd /k ".\.venv\Scripts\activate.bat && python server.py"
 
 timeout /t 6 /nobreak >nul
 
-start "SDR AI Training Lab - Public Tunnel" cmd /k "cloudflared tunnel --url http://127.0.0.1:8000"
+start "DaftraAI-Simulator - Public Tunnel" cmd /k "cloudflared tunnel --url http://127.0.0.1:8000"
 
 timeout /t 4 /nobreak >nul
 start "" http://localhost:8000

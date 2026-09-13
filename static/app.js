@@ -103,7 +103,7 @@ function renderLogin(error = '') {
     <header class="topbar">
       <div class="topbar-inner">
         <span class="logo">🎙️</span>
-        <h1>AI Simulator</h1>
+        <h1>DaftraAI-Simulator</h1>
       </div>
     </header>
     <main class="container">
@@ -1067,7 +1067,7 @@ function renderCandidateLogin(error = '') {
     <header class="topbar">
       <div class="topbar-inner">
         <span class="logo">🎙️</span>
-        <h1>AI Simulator - Test Call</h1>
+        <h1>DaftraAI-Simulator - Test Call</h1>
       </div>
     </header>
     <main class="container">
@@ -1139,7 +1139,7 @@ function renderCandidateReady(error = '') {
     <header class="topbar">
       <div class="topbar-inner">
         <span class="logo">🎙️</span>
-        <h1>AI Simulator - Test Call</h1>
+        <h1>DaftraAI-Simulator - Test Call</h1>
       </div>
     </header>
     <main class="container">
@@ -1214,7 +1214,7 @@ function renderCandidateCall(credentials) {
     <header class="topbar">
       <div class="topbar-inner">
         <span class="logo">🎙️</span>
-        <h1>AI Simulator - Test Call</h1>
+        <h1>DaftraAI-Simulator - Test Call</h1>
       </div>
     </header>
     <main class="container call-screen">
@@ -1362,7 +1362,7 @@ function renderCandidateCompletion() {
     <header class="topbar">
       <div class="topbar-inner">
         <span class="logo">🎙️</span>
-        <h1>AI Simulator - Test Call</h1>
+        <h1>DaftraAI-Simulator - Test Call</h1>
       </div>
     </header>
     <main class="container center">
