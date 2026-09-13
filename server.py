@@ -753,6 +753,18 @@ app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
 
 
 if __name__ == "__main__":
+    import asyncio
     import uvicorn
+
+    # Fetch webhook URL from Apps Script at startup
+    apps_script_url = os.getenv("HIRINGFLOW_WEBHOOK_URL", "")
+    if apps_script_url:
+        try:
+            from hiringflow_integration import fetch_webhook_url_from_script
+            asyncio.get_event_loop().run_until_complete(
+                fetch_webhook_url_from_script(apps_script_url)
+            )
+        except Exception as e:
+            print(f"[server] Could not fetch webhook URL from Apps Script: {e}")
 
     uvicorn.run(app, host="0.0.0.0", port=PORT)

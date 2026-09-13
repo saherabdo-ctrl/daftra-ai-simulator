@@ -741,7 +741,9 @@ class CustomerAgent(Agent):
 
     async def _send_hiringflow_callback(self, result: dict) -> None:
         """Send evaluation result to HiringFlow webhook."""
-        if not self.callback_url:
+        from hiringflow_integration import get_webhook_url
+        webhook_url = get_webhook_url()
+        if not webhook_url:
             return
 
         try:
@@ -777,7 +779,7 @@ class CustomerAgent(Agent):
 
             async with httpx.AsyncClient(timeout=30) as client:
                 response = await client.post(
-                    self.callback_url,
+                    webhook_url,
                     json=payload,
                     headers=headers
                 )
@@ -974,4 +976,16 @@ async def entrypoint(ctx: JobContext) -> None:
 
 
 if __name__ == "__main__":
+    import asyncio as _asyncio
+
+    # Fetch webhook URL from Apps Script at startup
+    if HIRINGFLOW_WEBHOOK_URL:
+        try:
+            from hiringflow_integration import fetch_webhook_url_from_script
+            _asyncio.get_event_loop().run_until_complete(
+                fetch_webhook_url_from_script(HIRINGFLOW_WEBHOOK_URL)
+            )
+        except Exception as e:
+            logger.warning("Could not fetch webhook URL from Apps Script: %s", e)
+
     cli.run_app(server)
