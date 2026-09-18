@@ -196,7 +196,7 @@ function getLanguage() {
 // mode instead of crashing, so it's easy to miss if you forget.
 const TRANSLATIONS = {
   // Shared brand/topbar
-  brand_name: { ar: 'Sales Heroes Arena', en: 'Sales Heroes Arena' },
+  brand_name: { ar: 'Daftra AI-Simulator', en: 'Daftra AI-Simulator' },
 
   // Login (internal) + Trial link + Scheduled test-call link
   login_title: { ar: 'تسجيل الدخول', en: 'Login' },
@@ -788,7 +788,7 @@ function renderAdminDashboard() {
       <nav class="admin-sidebar">
         <div class="admin-logo">
           <img class="logo" src="/Logo.png" alt="izam">
-          <h2>Daftra AI - Simulator</h2>
+          <h2>${t('brand_name')}</h2>
         </div>
         <div class="admin-nav">
           ${navHTML}
@@ -2363,7 +2363,7 @@ function topbar(userName) {
     <header class="topbar">
       <div class="topbar-inner">
         <img class="logo" src="/Logo.png" alt="izam">
-        <h1>Daftra Sales Heroes Arena</h1>
+        <h1>${t('brand_name')}</h1>
         <div class="topbar-user">
           <span class="muted small">${escapeHtml(userName || '')}</span>
           ${roleBadge()}
