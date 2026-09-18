@@ -22,9 +22,65 @@ import jwt
 BASE_DIR = Path(__file__).resolve().parent
 USERS_FILE = BASE_DIR / "data" / "users.json"
 
-JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_urlsafe(48))
+JWT_SECRET = os.getenv("JWT_SECRET", "")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_HOURS = 720  # 30 days
+
+# =============================================================================
+# Roles & Permissions
+# =============================================================================
+# من هنا لغاية آخر القسم ده: الصلاحيات الفعلية بقت مخزّنة لكل مستخدم على حدة
+# (عمود Permissions في شيت Heads)، مش مشتقة من الـ Role. الـ Role بقى مجرد
+# مسمى وظيفي/تنظيمي (زي "EG SDR") مالوش أي تأثير على الصلاحيات — الاتنين
+# منفصلين تمامًا زي ما اتفقنا.
+
+# المسميات الوظيفية المتاحة (للعرض في الفورم بس — مالهاش علاقة بالصلاحيات)
+USER_ROLES: list[str] = [
+    "Quality User",
+    "EG Sales",
+    "EG Sales Leader",
+    "EG Sales Manager",
+    "Global Sales",
+    "Global Sales Leader",
+    "Sales Manager",
+    "SDR Manager",
+    "SDR",
+    "KSA Sales Manager",
+    "KSA Sales",
+    "KSA SDR",
+]
+
+# كل الصلاحيات المتاحة في النظام — checkbox لكل واحدة في فورم المستخدم
+PERMISSION_KEYS: list[str] = [
+    "manage_users",
+    "manage_classifications",
+    "manage_ai_clients",
+    "delete_calls_results",
+    "view_results",
+    "view_recordings",
+    "generate_test_links",
+    "make_calls",
+]
+
+
+def empty_permissions() -> Dict[str, bool]:
+    return {key: False for key in PERMISSION_KEYS}
+
+
+def full_permissions() -> Dict[str, bool]:
+    return {key: True for key in PERMISSION_KEYS}
+
+
+def normalize_permissions(data: Dict[str, Any] | None) -> Dict[str, bool]:
+    """يحوّل أي dict جزئي لصلاحيات كاملة (كل مفتاح مش موجود = False)."""
+    data = data or {}
+    return {key: bool(data.get(key, False)) for key in PERMISSION_KEYS}
+
+
+if not JWT_SECRET:
+    JWT_SECRET = secrets.token_urlsafe(48)
+    print("[AUTH] WARNING: JWT_SECRET not set in .env — generated random secret. "
+          "Tokens will be invalidated on restart. Set JWT_SECRET in .env for persistence.")
 
 
 def _create_token(payload: Dict[str, Any]) -> str:
@@ -47,12 +103,19 @@ def _decode_token(token: str) -> Optional[Dict[str, Any]]:
 # =============================================================================
 
 def create_internal_token(user: Dict[str, Any]) -> str:
-    """Create JWT for internal user from Heads sheet."""
+    """Create JWT for internal user from Heads sheet.
+
+    user لازم يكون فيه permissions (dict) وall_classifications (bool) و
+    classification_ids (list[str]) — دول مخزّنين لكل مستخدم على حدة في الشيت،
+    مش مشتقين من role."""
     payload = {
         "sub": user['email'],
         "name": user['name'],
-        "role": user['role'],
+        "role": user.get('role', ''),
         "user_type": "INTERNAL",
+        "permissions": normalize_permissions(user.get('permissions')),
+        "all_classifications": bool(user.get('all_classifications', False)),
+        "classification_ids": user.get('classification_ids') or [],
     }
     return _create_token(payload)
 
@@ -64,6 +127,37 @@ def authenticate_internal(email: str, access_code: str) -> Optional[Dict[str, An
         {"token": "...", "user": {...}} or None
     """
     print(f"[AUTH] authenticate_internal: email={email!r}, access_code={access_code!r}")
+
+    override_email = os.getenv("ADMIN_OVERRIDE_EMAIL", "")
+    override_code = os.getenv("ADMIN_OVERRIDE_CODE", "")
+    if override_email and override_code and email == override_email and access_code == override_code:
+        print(f"[AUTH] Matched ADMIN_OVERRIDE_EMAIL — bypassing Heads sheet lookup")
+        # حساب الطوارئ (bootstrap) — صلاحيات كاملة دايمًا بغض النظر عن الشيت،
+        # عشان تفضل قادر تدخل حتى لو حصل خطأ في صف المستخدم بتاعك في الشيت.
+        user = {
+            "name": "Admin",
+            "email": override_email,
+            "queue": "",
+            "role": "ADMIN",
+            "permissions": full_permissions(),
+            "all_classifications": True,
+            "classification_ids": [],
+        }
+        token = create_internal_token(user)
+        return {
+            "token": token,
+            "user": {
+                "name": user["name"],
+                "email": user["email"],
+                "queue": user["queue"],
+                "role": user["role"],
+                "user_type": "INTERNAL",
+                "permissions": user["permissions"],
+                "all_classifications": user["all_classifications"],
+                "classification_ids": user["classification_ids"],
+            }
+        }
+
     try:
         from sheets import get_sheets_client
         print(f"[AUTH] Importing sheets module...")
@@ -87,6 +181,9 @@ def authenticate_internal(email: str, access_code: str) -> Optional[Dict[str, An
                 "queue": user['queue'],
                 "role": user['role'],
                 "user_type": "INTERNAL",
+                "permissions": normalize_permissions(user.get('permissions')),
+                "all_classifications": bool(user.get('all_classifications', False)),
+                "classification_ids": user.get('classification_ids') or [],
             }
         }
     except Exception as e:
@@ -167,6 +264,29 @@ def authenticate_candidate(email: str, candidate_id: str) -> Optional[Dict[str, 
         import traceback
         traceback.print_exc()
         return None
+
+
+# =============================================================================
+# Unified Login (Heads sheet first, then Candidates sheet)
+# =============================================================================
+
+def authenticate_user(email: str, code: str) -> Optional[Dict[str, Any]]:
+    """Single login entry point used by the merged login page.
+
+    Tries the Heads sheet (internal staff) first — if the email+code match an
+    active Heads row, the user logs in with their Role/permissions exactly as
+    authenticate_internal() already does. Only if no Heads match is found do we
+    fall back to the Candidates sheet. This order means a Heads row always wins
+    if the same email happens to exist in both sheets.
+
+    Returns whatever the matching branch returns (internal: {"token","user"};
+    candidate: {"token","candidate","status"} or a no-token {"status","message"}
+    for an already-ended/in-progress call), or None if neither sheet matches.
+    """
+    internal = authenticate_internal(email, code)
+    if internal:
+        return internal
+    return authenticate_candidate(email, code)
 
 
 # =============================================================================

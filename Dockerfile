@@ -7,17 +7,18 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
+
+RUN ffmpeg -version && ffprobe -version
 
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY . .
 
-# Create recordings directory
 RUN mkdir -p /recordings
 
-# Make entrypoint executable
 RUN chmod +x entrypoint.sh
 
 EXPOSE 8000

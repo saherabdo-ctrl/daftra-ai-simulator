@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -20,12 +21,15 @@ import httpx
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
-from livekit.agents import Agent, AgentServer, AgentSession, JobContext, JobExecutorType, JobProcess, cli, llm, TurnHandlingOptions
+from livekit.agents import Agent, AgentServer, AgentSession, JobContext, JobExecutorType, JobProcess, cli, llm, tts, TurnHandlingOptions
 from livekit.plugins import deepgram, groq, openai
 from livekit.plugins import silero
 import livekit.rtc
 
+from hiringflow_integration import send_result_to_hiringflow
+
 import edge_tts_tts
+import daftra_pricing
 import elevenlabs_tts
 import gemini_tts_tts
 import personas
@@ -35,6 +39,10 @@ load_dotenv()
 logger = logging.getLogger("sdr-agent")
 logger.setLevel(logging.INFO)
 
+
+# =============================================================================
+# Candidate Agent
+# =============================================================================
 
 def _validate_env():
     """Validate critical environment variables at startup. Fail fast with clear error."""
@@ -148,9 +156,336 @@ async def _resolve_scenario(ctx: JobContext) -> dict:
         except Exception:
             logger.exception("Failed to fetch custom scenario %s", scenario_id)
 
+    # Check if AI Client config is provided in metadata (dynamic persona)
+    try:
+        metadata = json.loads(ctx.job.metadata or "{}")
+        ai_client = metadata.get("ai_client") or {}
+        if ai_client and ai_client.get("client_id"):
+            scenario = _build_scenario_from_ai_client(ai_client, scenario_id)
+            if scenario:
+                return scenario
+    except Exception:
+        pass
+
     if scenario_id in personas.SCENARIOS:
         return personas.SCENARIOS[scenario_id]
     return list(personas.SCENARIOS.values())[0]
+
+
+DAFTRA_KNOWLEDGE_PATH = os.path.join(os.path.dirname(__file__), "data", "daftra_knowledge.md")
+
+
+def _load_daftra_knowledge() -> str:
+    """يقرأ قاعدة المعرفة العامة عن دفترة (قابلة للتعديل من صفحة الإعدادات)."""
+    try:
+        with open(DAFTRA_KNOWLEDGE_PATH, encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+    except Exception as e:
+        logger.warning("تعذّر قراءة قاعدة معرفة دفترة: %s", e)
+        return ""
+
+
+def _build_scenario_from_ai_client(ai_client: dict, scenario_id: str) -> Optional[dict]:
+    """Build a scenario dict from an AI Client's dynamic configuration."""
+    try:
+        import random as _random
+
+        # Start with base scenario if it exists
+        if scenario_id in personas.SCENARIOS:
+            base = dict(personas.SCENARIOS[scenario_id])
+        else:
+            base = dict(list(personas.SCENARIOS.values())[0])
+
+        # Override with AI Client config
+        name = ai_client.get('name', '')
+        customer_name = ai_client.get('customer_name', '') or name
+        customer_role = ai_client.get('customer_role', '')
+        company_name = ai_client.get('company_name', '')
+        business_field = ai_client.get('business_field', '')
+        # Country is the single source of truth for dialect (never trust a
+        # possibly-stale/independently-set Dialect column) — this guarantees the
+        # voice-pool selection below can never mismatch a Saudi client with an
+        # Egyptian voice or vice versa.
+        country = ai_client.get('country', '') or ('sa' if ai_client.get('dialect') == 'saudi' else 'eg')
+        dialect = 'egyptian' if country == 'eg' else 'saudi'
+        queue = ai_client.get('queue', '')
+        difficulty = ai_client.get('difficulty', 'medium')
+        personality = ai_client.get('personality', '')
+        instructions = ai_client.get('instructions', '')
+        objectives = ai_client.get('objectives', '')
+        objections = ai_client.get('objections', '')
+        product_brief = ai_client.get('product_brief', '')
+        voice = ai_client.get('voice', '')
+        temperature = ai_client.get('temperature', 'warm')
+        pain_point = ai_client.get('pain_point', '')
+        company_size = ai_client.get('company_size', '')
+        decision_maker = ai_client.get('decision_maker', True)
+        budget_sensitivity = ai_client.get('budget_sensitivity', 'متوسطة')
+        buying_intent = ai_client.get('buying_intent', 'متوسطة')
+        knowledgeable_raw = ai_client.get('knowledgeable', 'false')
+
+        # Handle random difficulty
+        if difficulty == 'random':
+            difficulty = _random.choice(['easy', 'medium', 'hard'])
+            logger.info("Random difficulty selected: %s", difficulty)
+
+        # Handle random personality
+        all_personalities = ['friendly', 'busy', 'hesitant', 'price_sensitive', 'skeptical',
+                            'angry', 'confused', 'interested', 'low_intent', 'competitor',
+                            'difficult', 'indecisive']
+        if personality == 'random':
+            personality = _random.choice(all_personalities)
+            logger.info("Random personality selected: %s", personality)
+
+        # Handle random knowledgeable (tristate: 'true' / 'false' / 'random')
+        if isinstance(knowledgeable_raw, bool):
+            knowledgeable = knowledgeable_raw
+        elif str(knowledgeable_raw).strip().lower() == 'random':
+            knowledgeable = _random.choice([True, False])
+            logger.info("Random knowledgeable selected: %s", knowledgeable)
+        else:
+            knowledgeable = str(knowledgeable_raw).strip().lower() == 'true'
+
+        # Classification-level call duration guidance/limit (min/max minutes) —
+        # read live so an admin's change takes effect on the very next call.
+        min_duration_minutes = None
+        max_duration_minutes = None
+        classification_id = ai_client.get('classification_id', '')
+        if classification_id:
+            try:
+                from sheets import get_sheets_client
+                classification = get_sheets_client().get_classification(classification_id)
+                if classification:
+                    raw_min = str(classification.get('min_duration_minutes', '')).strip()
+                    raw_max = str(classification.get('max_duration_minutes', '')).strip()
+                    if raw_min:
+                        min_duration_minutes = float(raw_min)
+                    if raw_max:
+                        max_duration_minutes = float(raw_max)
+            except Exception as e:
+                logger.warning("Failed to load classification duration settings: %s", e)
+
+        # صوت عشوائي من نفس اللهجة لما العميل الذكي مالوش صوت محدد صراحة
+        if not voice or voice == 'random':
+            voice = elevenlabs_tts.random_voice_for_dialect(dialect)
+            logger.info("Random voice selected for dialect %s: %s", dialect, voice)
+
+        base['id'] = scenario_id
+        base['name'] = f"{customer_name} – {business_field or company_name or scenario_id}"
+        base['customer_name'] = customer_name
+        base['customer_role'] = customer_role
+        base['company_name'] = company_name
+        base['business_field'] = business_field
+        base['dialect'] = dialect
+        base['difficulty'] = difficulty
+        base['country'] = country
+        base['queue'] = queue
+        base['classification_id'] = ai_client.get('classification_id', '')
+        base['temperature'] = temperature
+        base['voice'] = voice
+        base['pain_point'] = pain_point
+        base['company_size'] = company_size
+        base['decision_maker'] = decision_maker
+        base['budget_sensitivity'] = budget_sensitivity
+        base['buying_intent'] = buying_intent
+        base['knowledgeable'] = knowledgeable
+        base['personality'] = personality
+        base['min_duration_minutes'] = min_duration_minutes
+        base['max_duration_minutes'] = max_duration_minutes
+
+        # Build dynamic persona prompt
+        # Customer language: "ar" = Arabic, "en" = English
+        customer_language = ai_client.get('customer_language', 'ar')
+        is_customer_english = customer_language == "en"
+
+        if is_customer_english:
+            dialect_name = "Saudi" if dialect == "saudi" else "Egyptian"
+            difficulty_name = {"easy": "easygoing", "medium": "moderate", "hard": "tough"}.get(difficulty, "moderate")
+            personality_map = {
+                "friendly": "friendly and smiling",
+                "busy": "busy and rushed",
+                "hesitant": "hesitant and indecisive",
+                "price_sensitive": "price-sensitive, asks about cost a lot",
+                "skeptical": "skeptical about everything",
+                "angry": "annoyed and frustrated",
+                "confused": "confused, asks many questions",
+                "interested": "enthusiastic and interested",
+                "low_intent": "not interested, wants to end call",
+                "competitor": "uses a competitor, doesn't want to switch",
+                "difficult": "difficult, wants to set own terms",
+                "indecisive": "can't decide, changes mind often",
+            }
+        else:
+            dialect_name = "السعودية" if dialect == "saudi" else "المصرية"
+            difficulty_name = {"easy": "سهل", "medium": "متوسط", "hard": "صعب"}.get(difficulty, "متوسط")
+            personality_map = {
+                "friendly": "ودود ومبتسم",
+                "busy": "مشغول ومستعجل",
+                "hesitant": "متردد ويتراجع كثيرًا",
+                "price_sensitive": "حساس للسعر ويسأل عن التكلفة كثيرًا",
+                "skeptical": "متشكك في كل شيء",
+                "angry": "مزعوج وضيق الصدر",
+                "confused": "محتار ويسأل أسئلة كثيرة",
+                "interested": "متحمس ومهتم بالمنتج",
+                "low_intent": "غير مهتم ويريد إنهاء المكالمة",
+                "competitor": "يستخدم منافسًا ولا يريد التغيير",
+                "difficult": "صعب ويريد فرض شروطه",
+                "indecisive": "لا يعرف يقرر ويتراجع كثيرًا",
+            }
+
+        base['dialect_label'] = dialect_name
+        base['difficulty_label'] = difficulty_name
+        base['personality_label'] = personality_map.get(personality, personality or '')
+
+        personality_desc = ""
+        if personality and personality in personality_map:
+            if is_customer_english:
+                personality_desc = f" Behave like a {personality_map[personality]} person."
+            else:
+                personality_desc = f" تصرف مثل شخص {personality_map[personality]}."
+
+        if is_customer_english:
+            persona_parts = [
+                f"You are playing the role of {customer_name}, {customer_role} at {company_name or 'a company'}" + (f" in the {business_field} industry" if business_field else "") + ".",
+                f"You MUST speak English only. Do NOT speak Arabic.",
+                f"You are an {difficulty_name} customer to deal with." + personality_desc,
+                "SPEAK NATURALLY: Complete your sentences fully. Never cut off mid-sentence. "
+                "Use natural filler words like 'um', 'well', 'you know' but don't overdo it. "
+                "Show real emotions through your tone and word choice, but stay realistic. "
+                "React naturally to what the rep says. Keep responses conversational (2-4 sentences).",
+            ]
+        else:
+            # dialect-specific instructions
+            dialect_instructions = {
+                "saudi": (
+                    "Speak in Saudi Arabian dialect (خليجي سعودي عامي). "
+                    "Use authentic Saudi expressions like: يالله، ترى، وش، ليش، أيوا، لا، إن شاء الله، ماشاء الله، يعطيك العافية، تسلم، هلا والله، منو، وش رايك. "
+                    "Use Saudi sentence patterns. Sound natural like a real Saudi person talking on the phone."
+                ),
+                "egyptian": (
+                    "Speak in Egyptian dialect (مصري عامي). "
+                    "Use authentic Egyptian expressions like: إيه، أهلا، عايز، هينفع، ماشي، تمام، إن شاء الله، الله يخليك، تسلم، يا ريت، إزاي، أكيد، بس كده. "
+                    "Use Egyptian sentence patterns. Sound natural like a real Egyptian person talking on the phone."
+                ),
+            }
+            dialect_prompt = dialect_instructions.get(dialect, dialect_instructions["saudi"])
+            
+            persona_parts = [
+                f"You are playing the role of {customer_name}, {customer_role} at {company_name or 'a company'}" + (f" in the {business_field} industry" if business_field else "") + ".",
+                dialect_prompt,
+                f"You are a {difficulty_name} customer to deal with." + personality_desc,
+                "SPEAK NATURALLY: Complete your sentences fully. Never cut off mid-sentence. "
+                "Use natural filler words like 'يعني', 'أيوه', 'طيب' but don't overdo it. "
+                "Show real emotions (surprise, skepticism, interest) through your tone and word choice, "
+                "but stay realistic — don't be overly dramatic. "
+                "React naturally to what the rep says — laugh when something is funny, "
+                "show concern when worried, express doubt when skeptical. "
+                "Keep responses conversational length (2-4 sentences typically).",
+            ]
+            if pain_point:
+                persona_parts.append(f"Your main pain point is: {pain_point}.")
+            if product_brief:
+                persona_parts.append(f"Your business/product (what you sell): {product_brief}.")
+            if instructions:
+                persona_parts.append(f"Additional instructions: {instructions}.")
+            if objectives:
+                persona_parts.append(f"Your objectives in this call: {objectives}.")
+            if objections:
+                persona_parts.append(f"Your potential objections: {objections}.")
+            if company_size:
+                persona_parts.append(f"Company size: {company_size}.")
+            if decision_maker:
+                persona_parts.append("You are the decision maker.")
+            else:
+                persona_parts.append("You are NOT the decision maker — you need to consult your manager.")
+            persona_parts.append(f"Budget sensitivity: {budget_sensitivity}. Buying intent: {buying_intent}.")
+            if knowledgeable:
+                persona_parts.append("You are knowledgeable about accounting/finance.")
+
+        pricing_context = daftra_pricing.format_plans_for_prompt(country)
+        if pricing_context:
+            persona_parts.append(
+                "معلومات مرجعية عن أسعار وباقات دفترة (ممكن يكون العميل شافها على الموقع قبل المكالمة):\n"
+                + pricing_context
+            )
+            persona_parts.append(
+                "لو اتكلمتوا عن الأسعار: اسأل أسئلة عامة طبيعية زي عميل حقيقي بيفكر يشتري "
+                "(زي: الاشتراك شهري ولا سنوي؟ في خصم لو دفعت سنوي؟ الباقة دي فيها إيه بالظبط؟) "
+                "من غير ما تستجوب المندوب أو تسأل عن كل تفصيلة في الباقة. "
+                "لو المندوب رشّح لك باقة معينة، ركّز أسئلتك حوالين الباقة دي بس."
+            )
+        # ملحوظة: قاعدة معرفة دفترة الكاملة (data/daftra_knowledge.md) عمدًا مش
+        # بتتحقن هنا — العميل مش مفروض يكون خبير في منتج دفترة (ده شغل المندوب
+        # إنه يشرحه)، وحقنها هنا كانت هتتكرر مع كل رد في المكالمة (تكلفة توكنز
+        # عالية جدًا). بتتستخدم بدل كده مرة واحدة في تقييم المندوب (_evaluate)
+        # ومرة واحدة وقت توليد عملاء جدد (generate_ai_clients).
+
+        # Note: The greeting is sent via session.say() in on_enter.
+        # After greeting, respond naturally to the rep's introduction.
+        if is_customer_english:
+            persona_parts.append(
+                "You already greeted the rep. Now wait for them to introduce themselves, "
+                "then respond naturally based on your personality. Be conversational and realistic."
+            )
+        else:
+            persona_parts.append(
+                "لقد قلت تحية الترحيب بالفعل. الآن انتظر المندوب يقدم نفسه، ثم رد ب طبيعية حسب شخصيتك. "
+                "كن واقعيًا في ردودك ولا تكرر التحية."
+            )
+
+        # Classification's min-duration is soft guidance for the customer's own
+        # conversational pacing (the customer never controls when the call
+        # actually ends — that's the rep or the hard max-duration timer below).
+        if min_duration_minutes:
+            if is_customer_english:
+                persona_parts.append(
+                    f"This call is expected to last at least {min_duration_minutes:g} minutes — "
+                    "don't rush to end the conversation or give one-word answers; stay engaged and let it develop naturally."
+                )
+            else:
+                persona_parts.append(
+                    f"المفروض المكالمة دي تستمر {min_duration_minutes:g} دقيقة على الأقل — "
+                    "متستعجلش تنهي الكلام أو ترد بكلمة واحدة، خلي نفسك متفاعل واسيب المكالمة تاخد وقتها الطبيعي."
+                )
+
+        base['persona_prompt'] = "\n".join(persona_parts)
+        base['customer_role'] = customer_role
+        base['company_name'] = company_name
+        base['business_field'] = business_field
+        base['customer_language'] = customer_language
+
+        # Voice selection (use explicit voice if set, otherwise based on dialect and customer language)
+        if voice:
+            base['voice'] = voice
+        elif is_customer_english:
+            base['voice'] = "en-US-JennyNeural"
+        elif dialect == "egyptian":
+            base['voice'] = "ar-EG-SalmaNeural"
+        else:
+            base['voice'] = "ar-SA-HamedNeural"
+
+        # Set random first_line greeting based on dialect
+        if is_customer_english:
+            base['first_line'] = _random.choice([
+                "Hello?", "Hello, who is this?", "Hi, who am I speaking with?",
+                "Good morning.", "Good afternoon."
+            ])
+        elif dialect == "egyptian":
+            base['first_line'] = _random.choice([
+                "ألو؟", "ألو مين معاك؟", "السلام عليكم", "هلاو", "نعم؟", "ايوا، معاك مين؟"
+            ])
+        else:  # saudi
+            base['first_line'] = _random.choice([
+                "الو؟", "ألو مين معايا؟", "السلام عليكم", "هلا، مين معي؟", "نعم؟", "هلا والله"
+            ])
+
+        logger.info("Built dynamic scenario from AI Client %s: %s", ai_client.get('client_id'), base['name'])
+        return base
+    except Exception as e:
+        logger.warning("Failed to build scenario from AI Client: %s", e)
+        return None
 
 
 def _tts_voice_for(scenario: dict) -> str:
@@ -169,8 +504,11 @@ def _make_tts(scenario: dict):
         logger.info("TTS: Gemini TTS (%s) — أصوات عربية طبيعية بمشاعر", GEMINI_TTS_MODEL)
         return gemini_tts_tts.GeminiTTS(api_key=GEMINI_API_KEY, model=GEMINI_TTS_MODEL)
     if TTS_PROVIDER == "elevenlabs" and ELEVEN_API_KEY:
-        logger.info("TTS: ElevenLabs (أصوات سعودية)")
-        return elevenlabs_tts.ElevenLabsTTS(voice=scenario.get("voice"))
+        logger.info("TTS: ElevenLabs (أصوات سعودية) + Edge كاحتياط عند فشل/تعليق مؤقت")
+        return tts.FallbackAdapter([
+            elevenlabs_tts.ElevenLabsTTS(voice=scenario.get("voice")),
+            edge_tts_tts.EdgeTTS(voice=_tts_voice_for(scenario)),
+        ])
     logger.info("TTS: Microsoft Edge (مجاني)")
     return edge_tts_tts.EdgeTTS(voice=_tts_voice_for(scenario))
 
@@ -261,120 +599,8 @@ async def _ringtone_frames(chunk_ms: int = 20):
             )
 
 
-def _patch_recorder_mp3(session, output_path: str) -> None:
-    """يعمل monkey-patch لـRecorderIO ليحفظ التسجيل كـMP3 بدل OGG."""
-    import av as _av
-    import numpy as _np
-    from livekit.agents.voice.recorder_io import recorder_io as _rec
-    import threading as _threading
-    import queue as _queue
-    import contextlib as _ctx
-    from livekit.agents import utils as _utils
-
-    recorder = session._recorder_io
-    if recorder is None:
-        return
-
-    recorder._output_path = __import__("pathlib").Path(output_path)
-    recorder._output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    _orig_encode = recorder._encode_thread.__func__
-
-    def _mp3_encode_thread(self):
-        GROW_FACTOR = 1.5
-        INV_INT16 = 1.0 / 32768.0
-        output_path = self._output_path
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        container = _av.open(str(output_path), mode="w", format="mp3")
-        stream = container.add_stream("libmp3lame", rate=self._sample_rate, layout="stereo")
-        stream.codec_context.options["b:a"] = "128k"
-        in_resampler = None
-        out_resampler = None
-        capacity = self._sample_rate * 6
-        stereo_buf = _np.zeros((2, capacity), dtype=_np.float32)
-
-        def remix_and_resample(frames, channel_idx):
-            total_samples = sum(f.samples_per_channel * f.num_channels for f in frames)
-            nonlocal capacity, stereo_buf
-            if total_samples > capacity:
-                while capacity < total_samples:
-                    capacity = int(capacity * GROW_FACTOR)
-                stereo_buf.resize((2, capacity), refcheck=False)
-            pos = 0
-            dest = stereo_buf[channel_idx]
-            for f in frames:
-                count = f.samples_per_channel * f.num_channels
-                arr_i16 = _np.frombuffer(f.data, dtype=_np.int16, count=count).reshape(-1, f.num_channels)
-                sl = dest[pos:pos + f.samples_per_channel]
-                _np.sum(arr_i16, axis=1, dtype=_np.float32, out=sl)
-                sl *= INV_INT16 / f.num_channels
-                pos += f.samples_per_channel
-            return pos
-
-        try:
-            with container:
-                while True:
-                    input_buf = self._in_q.get()
-                    output_buf = self._out_q.get()
-                    if input_buf is None or output_buf is None:
-                        break
-                    if in_resampler is None and len(input_buf):
-                        in_resampler = livekit.rtc.AudioResampler(
-                            input_rate=input_buf[0].sample_rate,
-                            output_rate=self._sample_rate,
-                            num_channels=input_buf[0].num_channels,
-                        )
-                    if out_resampler is None and len(output_buf):
-                        out_resampler = livekit.rtc.AudioResampler(
-                            input_rate=output_buf[0].sample_rate,
-                            output_rate=self._sample_rate,
-                            num_channels=output_buf[0].num_channels,
-                        )
-                    input_resampled = []
-                    for frame in input_buf:
-                        input_resampled.extend(in_resampler.push(frame))
-                    output_resampled = []
-                    for frame in output_buf:
-                        output_resampled.extend(out_resampler.push(frame))
-                    if output_buf:
-                        output_resampled.extend(out_resampler.flush())
-                    len_left = remix_and_resample(input_resampled, 0)
-                    len_right = remix_and_resample(output_resampled, 1)
-                    if len_left != len_right:
-                        diff = abs(len_right - len_left)
-                        if len_left < len_right:
-                            stereo_buf[0, diff:diff + len_left] = stereo_buf[0, :len_left]
-                            stereo_buf[0, :diff] = 0.0
-                            len_left = len_right
-                        else:
-                            stereo_buf[1, diff:diff + len_right] = stereo_buf[1, :len_right]
-                            stereo_buf[1, :diff] = 0.0
-                            len_right = len_left
-                    max_len = max(len_left, len_right)
-                    if max_len <= 0:
-                        continue
-                    stereo_slice = stereo_buf[:, :max_len]
-                    av_frame = _av.AudioFrame.from_ndarray(stereo_slice, format="fltp", layout="stereo")
-                    av_frame.sample_rate = self._sample_rate
-                    for packet in stream.encode(av_frame):
-                        container.mux(packet)
-                for packet in stream.encode(None):
-                    container.mux(packet)
-        except Exception:
-            logger.exception("MP3 recorder encode thread failed")
-        finally:
-            def resolve():
-                if not self._close_fut.done():
-                    self._close_fut.set_result(None)
-            with _ctx.suppress(RuntimeError):
-                self._loop.call_soon_threadsafe(resolve)
-
-    recorder._encode_thread = lambda: _mp3_encode_thread(recorder)
-    logger.info("RecorderIO patched to save MP3 to %s", output_path)
-
-
 class CustomerAgent(Agent):
-    def __init__(self, scenario: dict, room_name: str, room=None, username: str = "", industry: str = "", test_session_id: str = "", candidate_id: str = "", candidate_email: str = "", user_type: str = "INTERNAL", callback_url: str = "") -> None:
+    def __init__(self, scenario: dict, room_name: str, room=None, username: str = "", industry: str = "", test_session_id: str = "", candidate_id: str = "", candidate_email: str = "", candidate_name: str = "", user_type: str = "INTERNAL", callback_url: str = "", call_type: str = "AUDIO_CALL", attempt_id: str = "", call_id: str = "") -> None:
         self.scenario = scenario
         self.room_name = room_name
         self.room = room
@@ -383,79 +609,100 @@ class CustomerAgent(Agent):
         self.test_session_id = test_session_id
         self.candidate_id = candidate_id
         self.candidate_email = candidate_email
+        self.candidate_name = candidate_name or username
         self.user_type = user_type
         self.callback_url = callback_url
+        self.call_type = call_type
+        self.attempt_id = attempt_id
+        self.call_id = call_id
         self.started_at = time.monotonic()
         self.transcript: list[dict] = []
         self._seen_ids: set = set()
         self._reported = False
         self._call_dir: str = ""
+        self._max_duration_task = None
         super().__init__(instructions=scenario["persona_prompt"])
 
     def _get_call_dir(self) -> str:
-        """يُرجع مسار مجلد المكالمة: {username} - {Industry}"""
+        """يُرجع مسار مجلد المكالمة: {username} - {Industry}/{مُعرّف فريد للمكالمة}.
+        المُعرّف: AttemptID (مرشحين) أو CallID (عملاء الأدمن الذكيين) أو اسم الـ room
+        كحل أخير — لازم يكون فريد دايمًا، وإلا مكالمتين لنفس الاسم/الصناعة هيتكتب
+        تسجيلهم وPDF بعض فوق بعض في نفس المجلد."""
         if self._call_dir:
             return self._call_dir
         name = self.username or "unknown"
         ind = self.industry or "general"
         folder_name = f"{name} - {ind}"
+        unique_id = self.attempt_id or self.call_id or self.room_name
         # إزالة الأحرف غير المسموح بها في أسماء المجلدات
         for ch in r'<>:"/\|?*':
             folder_name = folder_name.replace(ch, "_")
-        self._call_dir = os.path.join(RECORDINGS_PATH, folder_name)
+            unique_id = unique_id.replace(ch, "_")
+        self._call_dir = os.path.join(RECORDINGS_PATH, folder_name, unique_id)
         return self._call_dir
 
     async def _send_ring_data(self) -> None:
-        """يرسل رسالة data للـfrontend لتشغيل رنين التليفون."""
+        """يرسل رسالة data للـfrontend لتشغيل رنين التليفون.
+
+        عند دخول on_enter، اتصال الغرفة أحيانًا لسه مش مكتمل تمامًا
+        (local_participant لسه مش جاهز)، فبنعيد المحاولة بفاصل قصير
+        بدل ما نستسلم من أول فشل.
+        """
         if not self.room:
             return
+        import json as _json
+        payload = _json.dumps({"type": "ring"}).encode("utf-8")
+        max_attempts = 15
+        for attempt in range(max_attempts):
+            try:
+                await self.room.local_participant.publish_data(payload, topic="ring")
+                logger.info("Ring data sent to frontend (attempt %d)", attempt + 1)
+                return
+            except Exception as e:
+                if attempt == max_attempts - 1:
+                    logger.warning("Ring data failed after retries: %s", e)
+                else:
+                    await asyncio.sleep(0.3)
+
+    async def _auto_end_after_max_duration(self, max_duration_minutes: float) -> None:
+        """Classification-level hard call-duration limit — disconnects the room
+        from the agent's own side once reached, if the human hasn't already
+        ended the call by then."""
         try:
-            import json as _json
-            payload = _json.dumps({"type": "ring"}).encode("utf-8")
-            self.room.local_participant.publish_data(payload, topic="ring")
-            logger.info("Ring data sent to frontend")
+            await asyncio.sleep(max_duration_minutes * 60)
+            logger.info(
+                "Max call duration (%.1f min) reached for room %s — ending call",
+                max_duration_minutes, self.room_name,
+            )
+            if self.room:
+                await self.room.disconnect()
+        except asyncio.CancelledError:
+            pass
         except Exception as e:
-            logger.warning("Ring data failed: %s", e)
+            logger.warning("Auto-end-call timer failed for room %s: %s", self.room_name, e)
 
     async def on_enter(self) -> None:
         logger.info("Call started for room %s", self.room_name)
-        # ارسال رنين التليفون للـfrontend فورًا (3 حلقات = 8 ثواني)
+        max_duration_minutes = self.scenario.get('max_duration_minutes')
+        if max_duration_minutes:
+            self._max_duration_task = asyncio.create_task(self._auto_end_after_max_duration(max_duration_minutes))
+        # ارسال رنين التليفون للـfrontend فورًا (رنة واحدة 4 ثواني)
         await self._send_ring_data()
-        # انتظار حتى يخلص الرنين3 مرات +½ ثانية بعده
-        await asyncio.sleep(8.5)
-        await self.session.say(self.scenario["first_line"])
+        # انتظار حتى يخلص الرنين
+        await asyncio.sleep(1.5)
+        # العميل يرد بأول تحية
+        try:
+            await self.session.say(self.scenario["first_line"])
+        except Exception as e:
+            logger.warning("Failed to send first_line: %s", e)
 
     async def on_exit(self) -> None:
         logger.info("Call ended for room %s (%d turns)", self.room_name, len(self.transcript))
+        if self._max_duration_task and not self._max_duration_task.done():
+            self._max_duration_task.cancel()
         self._save_call_data()
-
-    def _convert_ogg_to_mp3(self) -> None:
-        """يحوّل audio.ogg إلى MP3 في مجلد المكالمة."""
-        try:
-            import av as _av
-            call_dir = self._get_call_dir()
-            ogg_path = os.path.join(call_dir, "audio.ogg")
-            mp3_name = f"{self.username} - {self.industry}.mp3" if self.username and self.industry else "recording.mp3"
-            for ch in r'<>:"/\|?*':
-                mp3_name = mp3_name.replace(ch, "_")
-            mp3_path = os.path.join(call_dir, mp3_name)
-            if not os.path.exists(ogg_path):
-                logger.info("No audio.ogg found at %s", ogg_path)
-                return
-            inp = _av.open(ogg_path)
-            out = _av.open(mp3_path, mode="w", format="mp3")
-            stream_out = out.add_stream("libmp3lame", rate=48000, layout="stereo")
-            stream_out.codec_context.options["b:a"] = "128k"
-            for frame in inp.decode(audio=0):
-                for packet in stream_out.encode(frame):
-                    out.mux(packet)
-            for packet in stream_out.encode(None):
-                out.mux(packet)
-            out.close()
-            inp.close()
-            logger.info("Recording converted to MP3: %s", mp3_path)
-        except Exception as e:
-            logger.warning("OGG to MP3 conversion failed: %s", e)
+        if hasattr(self, '_call_ended_event') and self._call_ended_event is not None:
+            self._call_ended_event.set()
 
     def _save_call_data(self) -> None:
         """يحفظ النص في مجلد المكالمة."""
@@ -475,7 +722,7 @@ class CustomerAgent(Agent):
         except Exception as e:
             logger.warning("Failed to save call data: %s", e)
 
-    async def evaluate_and_report(self) -> None:
+    async def evaluate_and_report(self, recording_data: dict = None) -> None:
         """Evaluate the SDR once the call is over and post the result. Safe to call twice."""
         if self._reported:
             logger.info("Evaluation already reported for room %s — skipping duplicate", self.room_name)
@@ -483,6 +730,13 @@ class CustomerAgent(Agent):
         try:
             duration = max(0, round(time.monotonic() - self.started_at))
             result = None
+
+            # CRITICAL: Only evaluate if we have actual transcript turns
+            if not self.transcript:
+                logger.error("EVALUATION BLOCKED: No transcript turns recorded — refusing to generate fallback score=0")
+                logger.error("This indicates STT/recording pipeline failure. Candidate result NOT written to Sheets.")
+                return
+
             try:
                 result = await self._evaluate(duration)
             except Exception as e:
@@ -500,54 +754,89 @@ class CustomerAgent(Agent):
                     eval_path = os.path.join(call_dir, "evaluation.json")
                     with open(eval_path, "w", encoding="utf-8") as f:
                         json.dump(result, f, ensure_ascii=False, indent=2)
+                    # Generate PDF evaluation report
+                    pdf_path = self._generate_eval_pdf(result)
+                    if pdf_path:
+                        result["_pdf_path"] = pdf_path
                 except Exception as e:
                     logger.warning("Failed to save evaluation: %s", e)
             else:
-                # Fallback: LLM eval failed, build minimal result with transcript
-                logger.warning("Using fallback result for room %s (LLM eval unavailable)", self.room_name)
+                # LLM eval failed but we HAVE transcript - build minimal result from transcript
+                logger.warning("Using minimal result for room %s (LLM eval failed but transcript exists)", self.room_name)
                 result = {
                     "scenario": self.scenario.get("id", ""),
                     "scenario_name": self.scenario.get("name", ""),
                     "customer_name": self.scenario.get("customer_name", ""),
+                    "classification_id": self.scenario.get("classification_id", ""),
                     "duration_seconds": duration,
                     "transcript": self.transcript,
-                    "scores": {},
+                    "criteria": [],
                     "overall_score": 0,
                     "strengths": [],
                     "areas_for_improvement": [],
-                    "coaching": "Evaluation was unavailable. Score defaults to 0.",
+                    "coaching": "LLM evaluation unavailable; transcript recorded but not scored.",
                     "next_step_action": "",
                     "lead_status": "unrated",
-                    "lead_status_reason": "LLM evaluation failed",
+                    "lead_status_reason": "LLM evaluation failed — transcript available",
                 }
-                # Save fallback evaluation
                 try:
                     call_dir = self._get_call_dir()
                     os.makedirs(call_dir, exist_ok=True)
                     eval_path = os.path.join(call_dir, "evaluation.json")
                     with open(eval_path, "w", encoding="utf-8") as f:
                         json.dump(result, f, ensure_ascii=False, indent=2)
+                    # Generate PDF evaluation report
+                    pdf_path = self._generate_eval_pdf(result)
+                    if pdf_path:
+                        result["_pdf_path"] = pdf_path
                 except Exception as e:
-                    logger.warning("Failed to save fallback evaluation: %s", e)
+                    logger.warning("Failed to save minimal evaluation: %s", e)
 
             # Post result to local webhook
             await self._post_result(result)
 
+            # Update call in Calls sheet (for ALL users, not just candidates)
+            try:
+                from sheets import get_sheets_client
+                sheets = get_sheets_client()
+                overall_score = result.get('overall_score', 0) if result else 0
+                sheets.update_call_end(self.room_name, overall_score)
+                logger.info("Call end updated in Calls sheet: room=%s, score=%s", self.room_name, overall_score)
+            except Exception as e:
+                logger.warning("Failed to update call end in Calls sheet: %s", e)
+
             # Handle candidate-specific post-call actions
             if self.user_type == "CANDIDATE":
-                await self._handle_candidate_completion(result)
+                await self._handle_candidate_completion(result, recording_data or {})
 
             # Send results to HiringFlow if callback_url is configured
             if self.callback_url:
-                await self._send_hiringflow_callback(result)
+                await self._send_hiringflow_callback(result, recording_data or {})
 
             self._reported = True
         except Exception:
             logger.exception("Evaluation failed for room %s", self.room_name)
 
-    async def _handle_candidate_completion(self, result: dict) -> None:
+    async def _handle_candidate_completion(self, result: dict, recording_data: dict = None) -> None:
         """Handle candidate-specific completion: update status in Google Sheets."""
         if not self.candidate_id:
+            return
+        if not recording_data:
+            recording_data = {}
+
+        # CRITICAL: Only write result to Sheets if evaluation produced a valid score
+        # Do NOT write score=0/Failed when evaluation infrastructure failed
+        if not result or result.get('overall_score', 0) == 0 and result.get('lead_status') == 'unrated':
+            logger.warning("Candidate %s: skipping Sheets result update — evaluation incomplete/invalid", self.candidate_id)
+            # Still mark call as ended but don't set pass/fail
+            try:
+                from sheets import get_sheets_client
+                sheets = get_sheets_client()
+                timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                sheets.update_candidate_status(self.candidate_id, 'ended', timestamp)
+                logger.info("Candidate %s status set to 'ended' (no score)", self.candidate_id)
+            except Exception as e:
+                logger.warning("Failed to update candidate status: %s", e)
             return
 
         # Step 1: Update sheet (score, result, status) — must succeed
@@ -568,85 +857,47 @@ class CustomerAgent(Agent):
             logger.warning("Failed to update candidate sheet: %s", e)
             return
 
-        # Step 2: Upload to Drive + write evaluation link — best effort
+        # Step 2: Update recording URLs and evaluation link from Drive
         try:
-            eval_link = await self._upload_to_drive(result)
+            from sheets import get_sheets_client
+            from drive_upload import get_drive_client, find_or_create_folder, get_shareable_link, FOLDER_NAME
+            sheets = get_sheets_client()
+
+            # Update recording URLs in Sheets
+            audio_url = recording_data.get('audio_recording', {}).get('url', '')
+            video_url = recording_data.get('video_recording', {}).get('url', '')
+            drive_folder_id = recording_data.get('drive_folder_id', '')
+            if audio_url or video_url or drive_folder_id:
+                sheets.update_candidate_recordings(self.candidate_id, drive_folder_id, audio_url, video_url)
+
+            # Get evaluation link from Shared Drive
+            drive = get_drive_client()
+            candidate_folder_name = f"{self.candidate_name or self.username or 'unknown'} - {self.candidate_id}" if self.candidate_id else (self.username or "unknown")
+            eval_link = get_shareable_link(drive, self.candidate_id, "evaluation.html", parent_name=FOLDER_NAME)
             if eval_link:
                 sheets.update_candidate_evaluation(self.candidate_id, eval_link)
                 logger.info("Candidate %s evaluation link written: %s", self.candidate_id, eval_link)
+
+            # Upload PDF evaluation to Drive
+            call_dir = self._get_call_dir()
+            pdf_path = os.path.join(call_dir, "evaluation.pdf")
+            if os.path.exists(pdf_path):
+                try:
+                    from drive_upload import upload_file, _find_folder, FOLDER_NAME
+                    # Find the candidate's folder
+                    parent_id = _find_folder(drive, FOLDER_NAME) if FOLDER_NAME else None
+                    folder_id = _find_folder(drive, self.candidate_id, parent_id)
+                    if folder_id:
+                        upload_file(drive, pdf_path, folder_id, "evaluation.pdf")
+                        logger.info("Candidate %s PDF evaluation uploaded to Drive", self.candidate_id)
+                except Exception as e:
+                    logger.warning("PDF upload failed: %s", e)
         except Exception as e:
-            logger.warning("Drive upload/eval link failed for %s: %s", self.candidate_id, e)
+            logger.warning("Evaluation link update failed for %s: %s", self.candidate_id, e)
 
     async def _upload_to_drive(self, result: dict) -> Optional[str]:
-        """Upload recording + evaluation to Google Drive in candidate subfolder.
-
-        Returns shareable link to the evaluation card, or None on failure.
-        """
-        try:
-            from drive_upload import (
-                get_drive_client,
-                find_or_create_folder,
-                upload_file,
-                get_shareable_link,
-                FOLDER_NAME,
-            )
-        except ImportError:
-            logger.warning("drive_upload module not available — skipping Drive upload")
-            return None
-
-        if not self.candidate_id:
-            return None
-
-        try:
-            drive = get_drive_client()
-            call_dir = self._get_call_dir()
-
-            # Find or create candidate subfolder
-            folder_id = find_or_create_folder(drive, self.candidate_id, parent_name=FOLDER_NAME)
-            if not folder_id:
-                logger.warning("Failed to create Drive folder for %s", self.candidate_id)
-                return None
-
-            # Upload recording (find any MP3 in call_dir)
-            mp3_path = None
-            if os.path.exists(call_dir):
-                for f in os.listdir(call_dir):
-                    if f.endswith(".mp3"):
-                        mp3_path = os.path.join(call_dir, f)
-                        break
-            if mp3_path:
-                upload_file(drive, mp3_path, folder_id)
-
-            # Upload transcript
-            transcript_path = os.path.join(call_dir, "transcript.json")
-            if os.path.exists(transcript_path):
-                upload_file(drive, transcript_path, folder_id)
-
-            # Generate and upload evaluation card
-            eval_html = self._generate_eval_card(result)
-            if eval_html:
-                eval_path = os.path.join(call_dir, "evaluation.html")
-                with open(eval_path, "w", encoding="utf-8") as f:
-                    f.write(eval_html)
-                upload_file(drive, eval_path, folder_id)
-
-            # Also upload raw evaluation JSON
-            eval_json_path = os.path.join(call_dir, "evaluation.json")
-            if os.path.exists(eval_json_path):
-                upload_file(drive, eval_json_path, folder_id)
-
-            # Get shareable link to evaluation card
-            eval_link = None
-            if eval_html:
-                eval_path = os.path.join(call_dir, "evaluation.html")
-                eval_link = get_shareable_link(drive, self.candidate_id, "evaluation.html", parent_name=FOLDER_NAME)
-
-            logger.info("Drive upload complete for %s: folder=%s", self.candidate_id, folder_id)
-            return eval_link
-
-        except Exception as e:
-            logger.warning("Drive upload failed for %s: %s", self.candidate_id, e)
-            return None
+        """DEPRECATED: Drive upload is now handled by the entrypoint function using LiveKit Egress."""
+        return None
 
     def _generate_eval_card(self, result: dict) -> str:
         """Generate an HTML evaluation card."""
@@ -656,7 +907,8 @@ class CustomerAgent(Agent):
         candidate_name = self.candidate_name or self.username or "Candidate"
         score = result.get("overall_score", 0)
         pass_fail = "Passed" if score >= 70 else "Failed"
-        scores = result.get("scores", {})
+        criteria = result.get("criteria", [])
+        config_error = result.get("config_error", "")
         strengths = result.get("strengths", [])
         improvements = result.get("areas_for_improvement", [])
         coaching = result.get("coaching", "")
@@ -669,11 +921,21 @@ class CustomerAgent(Agent):
             text = m.get("text", "")
             transcript_html += f'<p><strong>{role}:</strong> {text}</p>\n'
 
-        scores_html = ""
-        for cat, val in scores.items():
-            label = cat.replace("_", " ").title()
-            color = "#27ae60" if val >= 7 else ("#f39c12" if val >= 5 else "#e74c3c")
-            scores_html += f'<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #eee;"><span>{label}</span><span style="color:{color};font-weight:bold;">{val}/10</span></div>\n'
+        if config_error:
+            scores_html = f'<p style="color:#e74c3c;font-weight:bold;">{config_error}</p>\n'
+        elif not criteria:
+            scores_html = "<p>No criteria evaluated</p>\n"
+        else:
+            scores_html = ""
+            for c in criteria:
+                label = c.get("criterion", "")
+                val = c.get("score", 0)
+                weight = c.get("weight", 0)
+                color = "#27ae60" if val >= 61 else ("#f39c12" if val >= 31 else "#e74c3c")
+                scores_html += (
+                    f'<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #eee;">'
+                    f'<span>{label} ({weight:g}%)</span><span style="color:{color};font-weight:bold;">{val:g}/100</span></div>\n'
+                )
 
         strengths_html = "".join(f"<li>{s}</li>" for s in strengths) if strengths else "<li>None identified</li>"
         improvements_html = "".join(f"<li>{s}</li>" for s in improvements) if improvements else "<li>None identified</li>"
@@ -709,7 +971,7 @@ class CustomerAgent(Agent):
   </div>
 
   <div class="section">
-    <h3>Scores by Category</h3>
+    <h3>Scores by Criterion</h3>
     {scores_html}
   </div>
 
@@ -739,53 +1001,209 @@ class CustomerAgent(Agent):
 </body>
 </html>"""
 
-    async def _send_hiringflow_callback(self, result: dict) -> None:
-        """Send evaluation result to HiringFlow webhook."""
-        from hiringflow_integration import get_webhook_url
-        webhook_url = get_webhook_url()
-        if not webhook_url:
-            return
-
+    def _generate_eval_pdf(self, result: dict) -> Optional[str]:
+        """Generate a PDF evaluation report (بدعم كامل للعربي). Returns the file path or None."""
+        if not result:
+            return None
         try:
-            # Find recording file
+            from fpdf import FPDF
+            from fpdf.enums import XPos, YPos
+
+            def txt(value) -> str:
+                return "" if value is None else str(value)
+
+            candidate_name = txt(self.candidate_name or self.username or "Candidate")
+            score = result.get("overall_score", 0)
+            pass_fail = "Passed" if score >= 70 else "Failed"
+            criteria = result.get("criteria", [])
+            config_error = result.get("config_error", "")
+            strengths = result.get("strengths", [])
+            improvements = result.get("areas_for_improvement", [])
+            coaching = result.get("coaching", "")
+            lead_status = result.get("lead_status", "")
+            transcript = result.get("transcript", [])
+            scn = self.scenario or {}
+
+            pdf = FPDF()
+            pdf.set_auto_page_break(auto=True, margin=15)
+            # خط Amiri (يدعم العربي والإنجليزي معًا) + محرك تشكيل HarfBuzz لربط
+            # الحروف العربية وترتيب النص RTL بشكل صحيح تلقائيًا.
+            font_dir = os.path.join(os.path.dirname(__file__), "fonts")
+            pdf.add_font("Amiri", "", os.path.join(font_dir, "Amiri-Regular.ttf"))
+            pdf.add_font("Amiri", "B", os.path.join(font_dir, "Amiri-Bold.ttf"))
+            pdf.set_text_shaping(True)
+            pdf.add_page()
+
+            font = "Amiri"
+            font_b = "Amiri"
+
+            # Header
+            pdf.set_fill_color(44, 62, 80)
+            pdf.set_text_color(255, 255, 255)
+            pdf.set_font(font_b, "B", 18)
+            pdf.cell(0, 15, "Evaluation Report", new_x=XPos.LMARGIN, new_y=YPos.NEXT, fill=True, align="C")
+            pdf.set_font(font, "", 10)
+            scenario_name = txt(scn.get('name', ''))
+            date_str = datetime.now().strftime('%Y-%m-%d %H:%M')
+            pdf.cell(0, 8, f"{candidate_name} | {scenario_name} | {date_str}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, fill=True, align="C")
+            pdf.ln(5)
+
+            # Score
+            pdf.set_text_color(0, 0, 0)
+            if score >= 70:
+                pdf.set_text_color(39, 174, 96)
+            else:
+                pdf.set_text_color(231, 76, 60)
+            pdf.set_font(font_b, "B", 36)
+            pdf.cell(0, 20, f"{score}/100", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+            pdf.set_font(font_b, "B", 14)
+            pdf.cell(0, 10, pass_fail, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+            pdf.ln(3)
+
+            # Customer Persona — شخصية العميل اللي عمل المكالمة مع الموظف
+            persona_rows = []
+
+            def add_persona(label: str, value) -> None:
+                if value not in (None, ""):
+                    persona_rows.append((label, value))
+
+            add_persona("Customer", scn.get('customer_name'))
+            add_persona("Role", scn.get('customer_role'))
+            add_persona("Company", scn.get('company_name'))
+            add_persona("Industry", scn.get('business_field'))
+            add_persona("Dialect", scn.get('dialect_label') or scn.get('dialect'))
+            add_persona("Difficulty", scn.get('difficulty_label') or scn.get('difficulty'))
+            add_persona("Personality", scn.get('personality_label') or scn.get('personality'))
+            if scn.get('temperature'):
+                add_persona("Knows Daftra?", "Yes (warm)" if scn.get('temperature') == 'warm' else "No (cold)")
+            if 'decision_maker' in scn:
+                add_persona("Decision Maker", "Yes" if scn.get('decision_maker') else "No")
+            add_persona("Budget Sensitivity", scn.get('budget_sensitivity'))
+            add_persona("Buying Intent", scn.get('buying_intent'))
+            add_persona("Company Size", scn.get('company_size'))
+            add_persona("Pain Point", scn.get('pain_point'))
+
+            if persona_rows:
+                pdf.set_text_color(0, 0, 0)
+                pdf.set_font(font_b, "B", 13)
+                pdf.cell(0, 10, "Customer Persona", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                pdf.set_draw_color(200, 200, 200)
+                for label, value in persona_rows:
+                    pdf.set_font(font, "", 11)
+                    pdf.cell(50, 8, label, border="B")
+                    pdf.set_font(font_b, "B", 11)
+                    pdf.multi_cell(0, 8, txt(value), border="B", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                pdf.ln(3)
+
+            # Scores by Criterion (dynamic, per-Classification checklist from Google Sheets)
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_font(font_b, "B", 13)
+            pdf.cell(0, 10, "Scores by Criterion", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_draw_color(200, 200, 200)
+            if config_error:
+                pdf.set_text_color(231, 76, 60)
+                pdf.set_font(font, "", 10)
+                pdf.multi_cell(0, 7, txt(config_error), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            elif not criteria:
+                pdf.set_font(font, "", 10)
+                pdf.cell(0, 8, "No criteria evaluated", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            for c in criteria:
+                val = c.get("score", 0)
+                weight = c.get("weight", 0)
+                label = txt(f'{c.get("criterion", "")} ({weight:g}%)' if isinstance(weight, (int, float)) else c.get("criterion", ""))
+                if val >= 61:
+                    pdf.set_text_color(39, 174, 96)
+                elif val >= 31:
+                    pdf.set_text_color(243, 156, 18)
+                else:
+                    pdf.set_text_color(231, 76, 60)
+                pdf.set_font(font, "", 11)
+                pdf.cell(120, 8, label, border="B")
+                pdf.set_font(font_b, "B", 11)
+                pdf.cell(0, 8, f"{val:g}/100", new_x=XPos.LMARGIN, new_y=YPos.NEXT, border="B", align="R")
+            pdf.ln(3)
+
+            # Strengths
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_font(font_b, "B", 13)
+            pdf.cell(0, 10, "Strengths", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_font(font, "", 10)
+            for s in strengths:
+                pdf.multi_cell(0, 7, f"- {txt(s)}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            if not strengths:
+                pdf.cell(0, 7, "None identified", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.ln(3)
+
+            # Areas for Improvement
+            pdf.set_font(font_b, "B", 13)
+            pdf.cell(0, 10, "Areas for Improvement", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_font(font, "", 10)
+            for s in improvements:
+                pdf.multi_cell(0, 7, f"- {txt(s)}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            if not improvements:
+                pdf.cell(0, 7, "None identified", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.ln(3)
+
+            # Coaching Notes
+            pdf.set_font(font_b, "B", 13)
+            pdf.cell(0, 10, "Coaching Notes", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_font(font, "", 10)
+            pdf.multi_cell(0, 7, txt(coaching or "No coaching notes."), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.ln(3)
+
+            # Lead Status
+            pdf.set_font(font_b, "B", 13)
+            pdf.cell(0, 10, f"Lead Status: {txt(lead_status.upper() if lead_status else 'N/A')}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.ln(3)
+
+            # Transcript
+            pdf.set_font(font_b, "B", 13)
+            pdf.cell(0, 10, "Transcript", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_font(font, "", 9)
+            pdf.set_fill_color(248, 249, 250)
+            for m in transcript:
+                role = "SDR" if m.get("role") == "user" else "Customer"
+                text = txt(m.get("text", ""))
+                line = f"{role}: {text}"
+                pdf.multi_cell(0, 6, line, fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            if not transcript:
+                pdf.cell(0, 7, "No transcript available.", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+            # Save PDF
             call_dir = self._get_call_dir()
-            recording_path = None
-            if os.path.exists(call_dir):
-                for f in os.listdir(call_dir):
-                    if f.endswith(".mp3"):
-                        recording_path = os.path.join(call_dir, f)
-                        break
+            os.makedirs(call_dir, exist_ok=True)
+            pdf_path = os.path.join(call_dir, "evaluation.pdf")
+            pdf.output(pdf_path)
+            logger.info("Evaluation PDF saved: %s (%d bytes)", pdf_path, os.path.getsize(pdf_path))
+            return pdf_path
 
-            # Prepare callback payload
-            payload = {
-                "session_id": self.room_name,
-                "candidate_id": self.candidate_id,
-                "candidate_name": self.username,
-                "scenario": self.scenario.get("id", ""),
-                "overall_score": result.get("overall_score", 0),
-                "scores": result.get("scores", {}),
-                "lead_status": result.get("lead_status", ""),
-                "coaching": result.get("coaching", ""),
-                "transcript": self.transcript,
-                "duration_seconds": result.get("duration_seconds", 0),
-                "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                "recording_reference": recording_path,
-            }
+        except Exception as e:
+            logger.warning("Failed to generate evaluation PDF: %s", e, exc_info=True)
+            return None
 
-            # Send callback
-            headers = {"Content-Type": "application/json"}
-            if HIRINGFLOW_WEBHOOK_SECRET:
-                headers["Authorization"] = f"Bearer {HIRINGFLOW_WEBHOOK_SECRET}"
-
-            async with httpx.AsyncClient(timeout=30) as client:
-                response = await client.post(
-                    webhook_url,
-                    json=payload,
-                    headers=headers
-                )
-                response.raise_for_status()
-                logger.info("HiringFlow callback sent: HTTP %s", response.status_code)
-
+    async def _send_hiringflow_callback(self, result: dict, recording_data: dict = None) -> None:
+        """Send evaluation result to HiringFlow webhook with recording URLs."""
+        if not recording_data:
+            recording_data = {}
+        drive_folder_id = recording_data.get("drive_folder_id", "")
+        audio_recording = recording_data.get("audio_recording")
+        video_recording = recording_data.get("video_recording")
+        try:
+            from hiringflow_integration import send_result_to_hiringflow
+            response = await send_result_to_hiringflow(
+                test_session_id=self.test_session_id,
+                candidate_id=self.candidate_id,
+                score=result.get("overall_score", 0),
+                evaluation=result,
+                transcript=self.transcript,
+                drive_folder_id=drive_folder_id,
+                audio_recording=audio_recording,
+                video_recording=video_recording,
+            )
+            if response.get("success"):
+                logger.info("HiringFlow callback sent successfully (attempts=%d)", response.get("attempts"))
+            else:
+                logger.warning("HiringFlow callback failed: %s", response.get("error"))
         except Exception as e:
             logger.warning("HiringFlow callback failed: %s", e)
 
@@ -818,6 +1236,70 @@ class CustomerAgent(Agent):
             ("SDR" if m["role"] == "user" else "CUSTOMER") + ": " + m["text"]
             for m in self.transcript
         ]
+
+        from sheets import get_sheets_client
+        sheets_client = get_sheets_client()
+
+        classification_id = self.scenario.get("classification_id", "")
+        classification = sheets_client.get_classification(classification_id) if classification_id else None
+        classification_name = (classification or {}).get("name", "").strip()
+
+        base_result = {
+            "scenario": self.scenario["id"],
+            "scenario_name": self.scenario["name"],
+            "customer_name": self.scenario["customer_name"],
+            "classification_id": classification_id,
+            "classification_name": classification_name,
+            "duration_seconds": duration,
+            "transcript": self.transcript,
+            "criteria": [],
+            "overall_score": 0,
+            "strengths": [],
+            "areas_for_improvement": [],
+            "coaching": "",
+            "next_step_action": "",
+            "lead_status": "",
+            "lead_status_reason": "",
+        }
+
+        if not classification_name:
+            msg = (
+                f"لا يوجد تصنيف (Classification) مرتبط بهذا العميل الذكي (classification_id={classification_id!r})، "
+                "فلا يمكن تحديد قائمة التقييم (Test Calls Checklist). تم إيقاف التقييم."
+            )
+            logger.error("Evaluation blocked for room %s: %s", self.room_name, msg)
+            return {**base_result, "config_error": msg}
+
+        raw_checklist = sheets_client.get_checklist(classification_name)
+        if raw_checklist is None:
+            msg = f'تعذّر قراءة قائمة التقييم (Test Calls Checklist) للتصنيف "{classification_name}" من Google Sheets.'
+            logger.error("Evaluation blocked for room %s: %s", self.room_name, msg)
+            return {**base_result, "config_error": msg}
+
+        try:
+            checklist = personas.validate_checklist(classification_name, raw_checklist)
+        except personas.ChecklistError as e:
+            logger.error("Evaluation blocked for room %s: %s", self.room_name, e)
+            return {**base_result, "config_error": str(e)}
+
+        checklist_version = str(checklist[0].get("version", "") or "") if checklist else ""
+        eval_system_prompt = personas.build_evaluation_prompt(classification_name, checklist)
+        reference_parts = []
+        pricing_ref = daftra_pricing.format_plans_for_prompt(self.scenario.get('country', ''))
+        if pricing_ref:
+            reference_parts.append(pricing_ref)
+        knowledge_ref = _load_daftra_knowledge()
+        if knowledge_ref:
+            reference_parts.append(knowledge_ref)
+        if reference_parts:
+            eval_system_prompt += (
+                "\n\nمعلومات مرجعية عن دفترة (أسعار حالية ومعلومات عامة) — استخدمها في التقييم: "
+                "لو المندوب ذكر سعرًا أو تفاصيل باقة مخالفة للمرجع ده، اعتبرها نقطة سلبية واذكرها صراحة "
+                'في "areas_for_improvement". لو سياق المكالمة استلزم توضيح الفرق بين "المستخدم" و"الموظف" '
+                'ومقالش المندوب، اذكرها كمان في "areas_for_improvement".\n\n'
+                + "\n\n".join(reference_parts)
+            )
+
         clients = []
         if GEMINI_API_KEY:
             clients.append(_make_eval_client())
@@ -836,7 +1318,7 @@ class CustomerAgent(Agent):
                     model=eval_model,
                     response_format={"type": "json_object"},
                     messages=[
-                        {"role": "system", "content": personas.EVALUATION_SYSTEM_PROMPT},
+                        {"role": "system", "content": eval_system_prompt},
                         {"role": "user", "content": "Transcript:\n" + "\n".join(lines)},
                     ],
                 )
@@ -851,14 +1333,12 @@ class CustomerAgent(Agent):
 
         raw = resp.choices[0].message.content or "{}"
         data = json.loads(raw)
+        criteria_result, overall_score = personas.compute_weighted_result(checklist, data.get("criteria", []))
         return {
-            "scenario": self.scenario["id"],
-            "scenario_name": self.scenario["name"],
-            "customer_name": self.scenario["customer_name"],
-            "duration_seconds": duration,
-            "transcript": self.transcript,
-            "scores": data.get("scores", {}),
-            "overall_score": data.get("overall_score", 0),
+            **base_result,
+            "criteria": criteria_result,
+            "overall_score": overall_score,
+            "checklist_version": checklist_version,
             "strengths": data.get("strengths", []),
             "areas_for_improvement": data.get("areas_for_improvement", []),
             "coaching": data.get("coaching", ""),
@@ -879,6 +1359,77 @@ class CustomerAgent(Agent):
             logger.info("Result POSTed for room %s (HTTP %s)", self.room_name, response.status_code)
 
 
+def _daily_pricing_refresh_loop() -> None:
+    """يحدّث cache أسعار دفترة كل يوم الساعة 8 صباحًا بتوقيت القاهرة، لكل الدول
+    المعروفة في daftra_pricing.KNOWN_COUNTRIES. يعمل مرة واحدة فورًا عند بدء
+    تشغيل الـ worker (تحسبًا لعدم وجود cache خالص)، وبعدين كل 24 ساعة."""
+    import threading
+    import time as _time
+    from datetime import datetime, timedelta
+
+    try:
+        from zoneinfo import ZoneInfo
+        cairo_tz = ZoneInfo("Africa/Cairo")
+    except Exception:
+        cairo_tz = None
+
+    def _refresh_all():
+        for country in daftra_pricing.KNOWN_COUNTRIES:
+            try:
+                daftra_pricing.refresh_plans_cache(country)
+            except Exception as e:
+                logger.warning("فشل تحديث أسعار دفترة (%s): %s", country, e)
+
+    def _loop():
+        _refresh_all()
+        while True:
+            now = datetime.now(cairo_tz) if cairo_tz else datetime.utcnow()
+            next_run = now.replace(hour=8, minute=0, second=0, microsecond=0)
+            if next_run <= now:
+                next_run += timedelta(days=1)
+            _time.sleep(max((next_run - now).total_seconds(), 1))
+            _refresh_all()
+
+    threading.Thread(target=_loop, daemon=True, name="daftra-pricing-refresh").start()
+
+
+def _test_call_link_poller_loop() -> None:
+    """يفحص شيت Candidates كل 5 دقايق، ولأي مرشح حدد ميعاد اختبار (TestCallScheduledAt)
+    ولسه مالوش لينك (TestCallLink)، يولّد لينك آمن ويكتبه في صف المرشح نفسه —
+    بداية من ساعة قبل الميعاد. ملحوظة: لا يلمس TestCallLinkSentAt (ده مسؤولية
+    Apps Script خارجي بيبعت الإيميل للمرشح). لو المرشح غيّر ميعاده بعد ما اتولدله
+    لينك، المتوقع إن البلاتفورم التانية تمسح TestCallLink/TestCallToken وقت التأجيل
+    عشان الفحص ده يعتبره مرشح جديد محتاج لينك تاني تلقائيًا."""
+    import threading
+    import time as _time
+
+    def _poll_once():
+        try:
+            from sheets import get_sheets_client
+            sheets = get_sheets_client()
+            candidates = sheets.get_candidates_needing_test_link()
+            for candidate in candidates:
+                candidate_id = candidate.get('candidate_id', '')
+                if not candidate_id:
+                    continue
+                link = sheets.generate_test_call_link(candidate_id, SCENARIOS_BASE_URL)
+                if link:
+                    logger.info("Auto-generated test call link for candidate %s", candidate_id)
+        except Exception as e:
+            logger.warning("Test call link poller failed: %s", e)
+
+    def _loop():
+        while True:
+            _poll_once()
+            _time.sleep(300)
+
+    threading.Thread(target=_loop, daemon=True, name="test-call-link-poller").start()
+
+
+_daily_pricing_refresh_loop()
+_test_call_link_poller_loop()
+
+
 server = AgentServer(
     job_executor_type=JobExecutorType.THREAD,
     num_idle_processes=0,
@@ -888,16 +1439,24 @@ server = AgentServer(
 @server.rtc_session(agent_name=AGENT_NAME)
 async def entrypoint(ctx: JobContext) -> None:
     ctx.log_context_fields = {"room": ctx.room.name}
+    # اتصال صريح بالغرفة أول حاجة، عشان نضمن إن local_participant جاهز
+    # قبل ما on_enter يحاول يبعت إشارة الرنة (بدل الاعتماد على اتصال ضمني
+    # بيحصل جوه session.start() بتوقيت غير مضمون).
+    await ctx.connect()
     scenario = await _resolve_scenario(ctx)
 
-    # استخراج بيانات المستخدم والنشاط من metadata
+    # Parse metadata
     username = ""
     industry = ""
     test_session_id = ""
     candidate_id = ""
     candidate_email = ""
+    candidate_name = ""
     user_type = "INTERNAL"
     callback_url = ""
+    call_type = "AUDIO_CALL"
+    attempt_id = ""
+    call_id = ""
     try:
         metadata = json.loads(ctx.job.metadata or "{}")
         username = metadata.get("username", "")
@@ -905,15 +1464,19 @@ async def entrypoint(ctx: JobContext) -> None:
         test_session_id = metadata.get("test_session_id", "")
         candidate_id = metadata.get("candidate_id", "")
         candidate_email = metadata.get("candidate_email", "")
+        candidate_name = metadata.get("candidate_name", "")
         user_type = metadata.get("user_type", "INTERNAL")
         callback_url = metadata.get("callback_url", "")
+        call_type = metadata.get("call_type", "AUDIO_CALL")
+        attempt_id = metadata.get("attempt_id", "")
+        call_id = metadata.get("call_id", "")
     except Exception:
         pass
 
-    logger.info("Agent dispatched to %s for scenario %s (user=%s, industry=%s, user_type=%s)",
-               ctx.room.name, scenario["id"], username, industry, user_type)
+    logger.info("Agent dispatched to %s for scenario %s (user=%s, industry=%s, user_type=%s, call_type=%s)",
+               ctx.room.name, scenario["id"], username, industry, user_type, call_type)
 
-    # Load VAD lazily (no prewarm — avoids multiprocessing fork issues in cloud)
+    # Load VAD lazily
     vad = silero.VAD.load()
 
     session = AgentSession(
@@ -934,57 +1497,147 @@ async def entrypoint(ctx: JobContext) -> None:
         username=username, industry=industry,
         test_session_id=test_session_id,
         candidate_id=candidate_id, candidate_email=candidate_email,
-        user_type=user_type, callback_url=callback_url
+        candidate_name=candidate_name,
+        user_type=user_type, callback_url=callback_url,
+        call_type=call_type, attempt_id=attempt_id, call_id=call_id,
     )
 
     @session.on("conversation_item_added")
     def _on_item(item: Any) -> None:
         agent.record_item(item)
 
-    # توجيه مجلد التسجيلات إلى المسار المحدد
-    os.makedirs(RECORDINGS_PATH, exist_ok=True)
-    ctx._session_directory = __import__("pathlib").Path(RECORDINGS_PATH)
+    # ============================================================
+    # START SESSION — connects to room AND runs the call
+    # Audio recording is handled by AgentSession's built-in local
+    # RecorderIO (record="audio") — no LiveKit Egress / S3 involved.
+    # Finalization is triggered by on_exit() in CustomerAgent,
+    # which fires when the session closes due to participant disconnect.
+    # ============================================================
+    call_ended = asyncio.Event()
+    agent._call_ended_event = call_ended
 
-    await session.start(agent=agent, room=ctx.room, record=True)
-    await ctx.connect()
+    logger.info("SESSION: starting — waiting for call to end")
+    try:
+        await session.start(agent=agent, room=ctx.room, record={"audio": True})
+    except Exception as e:
+        logger.warning("Session start error: %s", e)
 
-    # بعد انتهاء الجلسة بالكامل: انتظار الملفات ثم المعالجة
-    import time as _time
-    ogg_path = os.path.join(RECORDINGS_PATH, "audio.ogg")
-    # انتظار حتى يكتمل ملف OGG تمامًا
-    for _ in range(30):
-        if os.path.exists(ogg_path) and os.path.getsize(ogg_path) > 0:
-            sz1 = os.path.getsize(ogg_path)
-            _time.sleep(1.0)
-            sz2 = os.path.getsize(ogg_path)
-            if sz1 == sz2:
-                break
-        _time.sleep(0.5)
-    # نقل OGG إلى مجلد المكالمة
+    # Block until on_exit() fires (participant disconnect)
+    await call_ended.wait()
+    logger.info("SESSION: call ended — beginning finalization")
+
+    # Grace period: wait for agent's last TTS output to finish playing
+    await asyncio.sleep(2.0)
+
+    # ============================================================
+    # LOCAL AUDIO RECORDING
+    # RecorderIO writes to ctx.session_directory/audio.ogg as part of the
+    # session's own teardown (which races with our call_ended signal), so
+    # poll briefly until the file exists and its size stops growing before
+    # copying it into the call's permanent local folder.
+    # ============================================================
+    audio_path = None
+    video_path = None  # video recording is no longer captured
     call_dir = agent._get_call_dir()
     os.makedirs(call_dir, exist_ok=True)
-    ogg_dst = os.path.join(call_dir, "audio.ogg")
+
+    recorder_path = ctx.session_directory / "audio.ogg"
+    last_size = -1
+    for _ in range(25):  # up to ~5s
+        if recorder_path.exists():
+            size = recorder_path.stat().st_size
+            if size > 0 and size == last_size:
+                break
+            last_size = size
+        await asyncio.sleep(0.2)
+
+    if recorder_path.exists() and recorder_path.stat().st_size > 0:
+        try:
+            audio_path = os.path.join(call_dir, "audio.ogg")
+            shutil.copyfile(recorder_path, audio_path)
+            logger.info("Local audio recording saved: %s (%d bytes)", audio_path, os.path.getsize(audio_path))
+        except Exception as e:
+            logger.error("Failed to save local recording: %s", e)
+            audio_path = None
+    else:
+        logger.error("Local audio recording not found at %s", recorder_path)
+
+    # ============================================================
+    # UPLOAD TO GOOGLE DRIVE
+    # ============================================================
+    audio_recording_obj = None
+    video_recording_obj = None  # video is no longer recorded
+    folder_id = ""
+
     try:
-        if os.path.exists(ogg_path) and not os.path.exists(ogg_dst):
-            os.rename(ogg_path, ogg_dst)
-    except Exception:
-        pass
-    # تحويل OGG → MP3
-    agent._convert_ogg_to_mp3()
-    # تقييم المكالمة
-    await agent.evaluate_and_report()
+        from drive_upload import get_drive_client, find_or_create_folder, upload_audio, FOLDER_NAME
+        drive = get_drive_client()
+        call_dir = agent._get_call_dir()
+        candidate_folder_name = f"{candidate_name or username or 'unknown'} - {candidate_id}" if candidate_id else (username or "unknown")
+
+        # Create folder structure: HiringFlow AI Simulator / Candidate Name - CandidateID
+        candidate_folder_id = find_or_create_folder(drive, candidate_folder_name, parent_name=FOLDER_NAME)
+        if candidate_folder_id and attempt_id:
+            attempt_folder_id = find_or_create_folder(drive, attempt_id, parent_name=candidate_folder_name)
+            if attempt_folder_id:
+                folder_id = attempt_folder_id
+            else:
+                folder_id = candidate_folder_id
+        else:
+            folder_id = candidate_folder_id
+
+        # Upload audio and video independently
+        if audio_path and os.path.exists(audio_path):
+            audio_file_id = upload_audio(drive, audio_path, folder_id or candidate_folder_id)
+            if audio_file_id:
+                audio_url = f"https://drive.google.com/file/d/{audio_file_id}/view"
+                audio_recording_obj = {
+                    "status": "uploaded",
+                    "file_id": audio_file_id,
+                    "url": audio_url,
+                }
+                logger.info("Audio uploaded: file_id=%s url=%s", audio_file_id, audio_url)
+            else:
+                audio_recording_obj = {"status": "failed", "file_id": "", "url": "", "error": "Upload failed"}
+                logger.error("Audio upload failed")
+
+    except Exception as e:
+        logger.error("Drive upload error: %s", e)
+
+    # ============================================================
+    # EVALUATION: transcript is finalized, recording is done
+    # ============================================================
+    logger.info("TRANSCRIPT FINALIZED: %d turns", len(agent.transcript))
+    if len(agent.transcript) == 0:
+        logger.error("EVALUATION BLOCKED: transcript is empty — evaluation skipped")
+        logger.error("Candidate result will NOT be written to Sheets (infrastructure failure)")
+    else:
+        # Build recording data for webhook
+        recording_data = {
+            "drive_folder_id": folder_id or "",
+            "audio_recording": audio_recording_obj,
+            "video_recording": video_recording_obj,
+        }
+        await agent.evaluate_and_report(recording_data)
+        logger.info("EVALUATION GENERATED: posting result")
+
+    # ملحوظة: مفيش cleanup هنا عن قصد — ملف الصوت المحلي (audio_path) في
+    # call_dir لازم يفضل محفوظ على الجهاز بشكل دائم، مش ملف مؤقت للرفع بس.
 
 
 if __name__ == "__main__":
     import asyncio as _asyncio
 
-    # Fetch webhook URL from Apps Script at startup
+    # Fetch webhook URL from Apps Script at startup - FIXED
     if HIRINGFLOW_WEBHOOK_URL:
         try:
             from hiringflow_integration import fetch_webhook_url_from_script
-            _asyncio.get_event_loop().run_until_complete(
-                fetch_webhook_url_from_script(HIRINGFLOW_WEBHOOK_URL)
-            )
+            try:
+                _asyncio.get_running_loop()
+                # Loop already running — skip scheduling, let it be handled
+            except RuntimeError:
+                # No running loop — create one
+                _asyncio.run(fetch_webhook_url_from_script(HIRINGFLOW_WEBHOOK_URL))
         except Exception as e:
             logger.warning("Could not fetch webhook URL from Apps Script: %s", e)
 

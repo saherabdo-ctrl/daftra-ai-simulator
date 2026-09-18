@@ -1,4 +1,4 @@
-"""سيناريوهات وشخصيات ومعايير التقييم لمعمل تدريب المبيعات (SDR AI Training Lab).
+"""سيناريوهات وشخصيات ومعايير التقييم لـ Sales Heroes Arena.
 
 أضف سيناريوهات جديدة هنا لتوسيع مكتبة التدريب. نص الشخصية هو الملف الخفي الذي
 يلعبه الذكاء الاصطناعي أثناء المكالمة — يجب ألا يكشف أبدًا عن معايير التقييم أو
@@ -742,59 +742,162 @@ SCENARIOS = {
     },
 }
 
-EVALUATION_CATEGORIES = [
-    {"id": "opening", "label": "الافتتاحية"},
-    {"id": "rapport", "label": "بناء العلاقة"},
-    {"id": "discovery", "label": "الاكتشاف"},
-    {"id": "active_listening", "label": "الإنصات النشط"},
-    {"id": "value_proposition", "label": "عرض القيمة"},
-    {"id": "objection_handling", "label": "معالجة الاعتراضات"},
-    {"id": "qualification", "label": "التأهيل"},
-    {"id": "next_steps", "label": "الخطوات التالية"},
-    {"id": "follow_up_commitment", "label": "الالتزام بالمتابعة"},
-    {"id": "professional_closing", "label": "الإنهاء المهني"},
-]
+# =============================================================================
+# Evaluation: criteria + weights are NOT hardcoded here.
+#
+# They are loaded live, per-Classification, from the "Test Calls Checklist"
+# Google Sheets tab (see sheets.py: get_checklist()). This module only builds
+# the evaluation prompt dynamically from whatever rows are loaded, validates
+# them, and computes the weighted score in Python. See agent.py: _evaluate().
+# =============================================================================
 
-EVALUATION_SYSTEM_PROMPT = """أنت مدرب مبيعات خبير تقيّم مندوب مبيعات في مكالمة اكتشاف مع عميل محتمل. اقرأ النص التالي (مميز بـ «المندوب» و«العميل») وقم بتقييم المندوب فقط. العميل هو العميل المحتمل ولا يُقيَّم.
 
-قيّم كل فئة من 0 إلى 10 بناءً على الأدلة في النص فقط:
-- الافتتاحية: تحية احترافية، تعريف بالنفس والشركة، بيان هدف المكالمة.
-- بناء العلاقة: تواصل طبيعي، استخدام اسم العميل، نبرة ودودة مهنية، طلب الإذن قبل التعمق.
-- الاكتشاف: أسئلة مفتوحة عن العملية الحالية والأدوات والمشاكل وأثرها والأهداف والميزانية وعملية اتخاذ القرار.
-- الإنصات النشط: الاعتراف بما قاله العميل، إعادة الصياغة/التلخيص، أسئلة متابعة ذات صلة بدلًا من المقاطعة أو الانتقال للموضوع التالي.
-- عرض القيمة: ربط القيمة بما شاركه العميل تحديدًا، دون عرض ترويجي عام.
-- معالجة الاعتراضات: معالجة المخاوف (خاصة السعر/العائد) بهدوء دون جدال أو إلحاح أو استسلام.
-- التأهيل: تحديد صاحب القرار، والإلحاح/الجدول الزمني، والميزانية أو الملاءمة.
-- الخطوات التالية: اقتراح خطوة تالية واضحة ومحددة (مثل عرض توضيحي أو مكالمة بوقت محدد).
-- الالتزام بالمتابعة: تأكيد التزام متابعة وكيفية جدولته.
-- الإنهاء المهني: إنهاء بأدب، وشكر العميل، وترك انطباع جيد.
+class ChecklistError(Exception):
+    """Raised when a classification's evaluation checklist is missing or misconfigured."""
 
-إرشادات التقييم: 0-3 مفقود أو ضار؛ 4-6 حاول لكن سطحي؛ 7-8 جيد؛ 9-10 ممتاز ومحدد. إن لم يوجد دليل على فئة، أعطِ درجة منخفضة. إن قفز المندوب مباشرة إلى العرض الترويجي دون اكتشاف، فيجب أن تكون درجات الاكتشاف/بناء العلاقة/الإنصات منخفضة. اجعل كل النصوص موجزة ومرتكزة على النص الفعلي.
 
-حدّد أيضًا حالة العميل بعد المكالمة في lead_status حسب سياق دفترة (عميل محتمل لا يعرف الشركة قبل المكالمة،
-والمندوب مطالب بتقديم نفسه ومنتجه بوضوح قبل التعمق، ومنتج دفترة نظام سحابي متكامل رسميًا مع هيئة
-الزكاة والضريبة والجمارك ZATCA للفاتورة الإلكترونية):
+def validate_checklist(classification_name: str, rows: list[dict]) -> list[dict]:
+    """Filter raw checklist rows down to the enabled, well-formed criteria to evaluate.
+
+    Raises ChecklistError (with a human-readable Arabic message meant for logs/UI)
+    if the classification has no checklist, no enabled criteria, a criterion with
+    an invalid/duplicate name, or if the enabled weights don't sum to 100%.
+    Never silently normalizes weights and never falls back to another classification.
+    """
+    if not rows:
+        raise ChecklistError(
+            f'لا توجد قائمة تقييم (Test Calls Checklist) مُعدّة للتصنيف "{classification_name}". '
+            "تم إيقاف التقييم بدلًا من استخدام قائمة تصنيف آخر."
+        )
+
+    enabled: list[dict] = []
+    seen_names: set[str] = set()
+    for row in rows:
+        enabled_flag = str(row.get("enabled", "")).strip().lower() in ("true", "1", "yes", "y")
+        if not enabled_flag:
+            continue
+        criterion = str(row.get("criterion", "")).strip()
+        if not criterion:
+            continue
+        weight = row.get("weight")
+        try:
+            weight = float(weight)
+        except (TypeError, ValueError):
+            raise ChecklistError(
+                f'وزن غير صالح للمعيار "{criterion}" في تصنيف "{classification_name}" (Test Calls Checklist).'
+            )
+        if weight <= 0:
+            raise ChecklistError(
+                f'وزن غير صالح (يجب أن يكون أكبر من صفر) للمعيار "{criterion}" في تصنيف "{classification_name}".'
+            )
+        key = criterion.strip().lower()
+        if key in seen_names:
+            raise ChecklistError(
+                f'معيار مكرر "{criterion}" في قائمة تقييم تصنيف "{classification_name}" (Test Calls Checklist).'
+            )
+        seen_names.add(key)
+        enabled.append({**row, "criterion": criterion, "weight": weight})
+
+    if not enabled:
+        raise ChecklistError(
+            f'لا توجد معايير مفعّلة (Enabled=TRUE) في قائمة تقييم تصنيف "{classification_name}".'
+        )
+
+    total = sum(r["weight"] for r in enabled)
+    if abs(total - 100.0) > 0.01:
+        raise ChecklistError(
+            f'خطأ في إعداد التقييم — تصنيف "{classification_name}": '
+            f"مجموع أوزان المعايير الفعّالة = {total:g}%، والمتوقع 100%."
+        )
+    return enabled
+
+
+def build_evaluation_prompt(classification_name: str, checklist: list[dict]) -> str:
+    """Build the evaluation system prompt dynamically from live checklist rows.
+
+    No criterion names, weights, or descriptions are hardcoded — they all come
+    from `checklist` (already validated by validate_checklist()).
+    """
+    blocks = []
+    for i, row in enumerate(checklist, 1):
+        block = f'{i}. {row["criterion"]}\nالوزن: {row["weight"]:g}%'
+        description = str(row.get("description", "") or "").strip()
+        if description:
+            block += f"\nالوصف: {description}"
+        instructions = str(row.get("instructions", "") or "").strip()
+        if instructions:
+            block += f"\nإرشادات التقييم: {instructions}"
+        blocks.append(block)
+    criteria_text = "\n\n".join(blocks)
+    criterion_names_json = json.dumps([row["criterion"] for row in checklist], ensure_ascii=False)
+
+    return f"""أنت مدرب مبيعات خبير تقيّم مندوب مبيعات (SDR) في مكالمة مع عميل محتمل. اقرأ النص التالي (مميز بـ «المندوب» و«العميل») وقيّم أداء المندوب فقط بناءً على الأدلة الموجودة في النص. العميل هو العميل المحتمل ولا يُقيَّم.
+
+التصنيف: {classification_name}
+
+معايير التقييم الفعّالة لهذا التصنيف فقط (اعتمد عليها حصرًا، ولا تخترع معايير أخرى، ولا تستخدم معايير تصنيف آخر):
+
+{criteria_text}
+
+لكل معيار من المعايير أعلاه، أعطِ درجة من 0 إلى 100 بناءً على الأدلة في النص فقط: 0-30 مفقود أو ضار؛ 31-60 حاول لكن سطحي؛ 61-85 جيد؛ 86-100 ممتاز ومحدد. إن لم يوجد دليل كافٍ على معيار، أعطِ درجة منخفضة واذكر ذلك في feedback. زوّد كل معيار بدليل نصي (اقتباس أو ملخص من المكالمة) في evidence يدعم الدرجة.
+
+حدّد أيضًا حالة العميل بعد المكالمة في lead_status حسب سياق دفترة (عميل محتمل لا يعرف الشركة قبل المكالمة، والمندوب مطالب بتقديم نفسه ومنتجه بوضوح قبل التعمق، ومنتج دفترة نظام سحابي متكامل رسميًا مع هيئة الزكاة والضريبة والجمارك ZATCA للفاتورة الإلكترونية):
 - "disqualified": العميل غير مناسب أو غير مهتم أو لا يملك الملاءمة (ميزانية/سلطة/حاجة/توقيت).
 - "follow_up": يوجد اهتمام لكنه ليس جاهزًا الآن، ويحتاج متابعة لاحقًا.
 - "mql": العميل مهتم وملائم ووافق على خطوة تالية قريبة (ينتقل إلى مندوب المبيعات).
 اكتب lead_status_reason جملة عربية قصيرة تبرر التصنيف.
 
-أعد JSON صارمًا (بدون markdown أو نصوص إضافية) بهذا الشكل تمامًا:
-{
-  "scores": {
-    "opening": 0, "rapport": 0, "discovery": 0, "active_listening": 0,
-    "value_proposition": 0, "objection_handling": 0, "qualification": 0,
-    "next_steps": 0, "follow_up_commitment": 0, "professional_closing": 0
-  },
-  "overall_score": 0,
+أعد JSON صارمًا (بدون markdown أو نصوص إضافية) بهذا الشكل تمامًا، بحيث تحتوي مصفوفة "criteria" على عنصر واحد بالضبط لكل معيار من المعايير المذكورة أعلاه بنفس الترتيب، وبحيث تكون قيمة "criterion" مطابقة حرفيًا لأحد الأسماء التالية: {criterion_names_json}:
+{{
+  "criteria": [
+    {{"criterion": "اسم المعيار كما ورد أعلاه", "score": 0, "feedback": "ملاحظة موجزة", "evidence": ["دليل من النص"]}}
+  ],
   "strengths": ["..."],
   "areas_for_improvement": ["..."],
   "coaching": "جملتان إلى أربع جمل من نصائح تدريب محددة مبنية على النص",
   "next_step_action": "إجراء محدد واحد لمحاولة المندوب التالية",
   "lead_status": "mql",
   "lead_status_reason": "جملة قصيرة"
-}
-overall_score عدد صحيح من 0 إلى 100."""
+}}
+لا تُدرج الوزن أو الدرجة الموزونة أو درجة إجمالية في الرد؛ سيتم حسابها خارجيًا من الأوزان الفعلية في Google Sheets."""
+
+
+def compute_weighted_result(checklist: list[dict], llm_criteria: list[dict]) -> tuple[list[dict], float]:
+    """Match the LLM's per-criterion scores back onto the authoritative checklist rows
+    and compute weighted scores in Python (weights ALWAYS come from the checklist,
+    never trusted from the LLM's own output). Returns (criteria_result_list, overall_score).
+    """
+    llm_by_name = {}
+    for item in llm_criteria or []:
+        name = str(item.get("criterion", "")).strip().lower()
+        if name and name not in llm_by_name:
+            llm_by_name[name] = item
+
+    out = []
+    total = 0.0
+    for row in checklist:
+        criterion = row["criterion"]
+        weight = row["weight"]
+        match = llm_by_name.get(criterion.strip().lower(), {})
+        try:
+            score = float(match.get("score", 0))
+        except (TypeError, ValueError):
+            score = 0.0
+        score = max(0.0, min(100.0, score))
+        weighted = round(score * weight / 100.0, 2)
+        total += weighted
+        evidence = match.get("evidence", [])
+        if not isinstance(evidence, list):
+            evidence = [str(evidence)] if evidence else []
+        out.append({
+            "criterion": criterion,
+            "weight": weight,
+            "score": round(score, 1),
+            "weighted_score": weighted,
+            "feedback": match.get("feedback", ""),
+            "evidence": evidence,
+        })
+    return out, round(total, 1)
 
 def build_first_line(brief: dict) -> str:
     """العميل يردّ فقط بـ«ألو؟» دون كشف اسمه أو شركته — على المندوب سؤاله عن الاسم."""
