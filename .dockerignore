@@ -3,7 +3,10 @@ __pycache__
 *.pyc
 .env
 .env.production
-data
+data/results
+data/scenarios
+data/calls
+data/users.json
 .git
 start.bat
 start-public.bat
