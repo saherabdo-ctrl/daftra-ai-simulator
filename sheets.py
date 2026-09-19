@@ -504,7 +504,7 @@ class GoogleSheetsClient:
                 if str(row.get(CANDIDATE_HEADER_NAMES['test_call_link'], '')).strip():
                     continue  # already has a link
                 status = str(row.get(CANDIDATE_HEADER_NAMES['test_call_status'], '')).strip().lower()
-                if status not in ('', 'pending'):
+                if status not in ('', 'pending', 'not_sent'):
                     continue  # started/ended/expired — not eligible for a fresh link
                 if max_reschedules >= 0:
                     try:

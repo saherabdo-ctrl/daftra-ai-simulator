@@ -348,7 +348,7 @@ async def candidate_start_call(req: CandidateStartCallRequest, request: Request)
         current_status = candidate.get('test_call_status', 'pending')
 
         # Check if call can be started
-        if current_status not in ('pending', 'LINK_SENT'):
+        if current_status not in ('pending', 'NOT_SENT', 'LINK_SENT'):
             raise HTTPException(
                 status_code=400,
                 detail=f"Cannot start call: status is {current_status}"
