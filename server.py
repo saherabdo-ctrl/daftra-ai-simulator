@@ -1542,7 +1542,7 @@ async def generate_ai_clients(req: GenerateAIClientsRequest, admin: dict = Depen
             "temperature": c.get("temperature") if c.get("temperature") in ("warm", "cold") else "warm",
             "product_brief": c.get("product_brief", ""),
             "voice": "",
-            "knowledgeable": bool(c.get("knowledgeable", False)),
+            "knowledgeable": "true" if c.get("knowledgeable", False) else "false",
             "active": True,
         }
         result = sheets.create_ai_client(payload)

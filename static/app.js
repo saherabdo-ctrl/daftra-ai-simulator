@@ -3032,7 +3032,7 @@ function renderAIClientsList() {
       form.querySelector('[name="temperature"]').value = c.temperature || 'warm';
       form.querySelector('[name="product_brief"]').value = c.product_brief || '';
       form.querySelector('[name="voice"]').value = c.voice || '';
-      form.querySelector('[name="knowledgeable"]').value = c.knowledgeable ? 'true' : 'false';
+      form.querySelector('[name="knowledgeable"]').value = c.knowledgeable || 'random';
       form.querySelector('[name="active"]').value = c.active === false ? 'false' : 'true';
       form.scrollIntoView({ behavior: 'smooth' });
     });
