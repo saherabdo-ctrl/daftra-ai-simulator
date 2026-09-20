@@ -381,6 +381,7 @@ const TRANSLATIONS = {
   ai_client_default_name: { ar: 'العميل', en: 'the client' },
   ai_client_start_call_confirm: { ar: 'ابدأ مكالمة مع "{name}"؟', en: 'Start a call with "{name}"?' },
   status_connecting: { ar: 'جاري الاتصال...', en: 'Connecting...' },
+  agent_no_response: { ar: 'لم يستجب النظام بعد. أنهِ المكالمة وحاول مرة أخرى بعد قليل.', en: "The system hasn't responded yet. End the call and try again in a moment." },
   ai_client_start_call_failed: { ar: 'فشل بدء المكالمة: {error}', en: 'Failed to start call: {error}' },
   generate_in_progress: { ar: 'جاري التوليد... (قد تستغرق دقيقة)', en: 'Generating... (may take a minute)' },
   generate_skipped_duplicates: { ar: '({count} اتجاهلوا لأنهم مكررين)', en: '({count} skipped as duplicates)' },
@@ -3423,9 +3424,7 @@ async function connectCall(scenario, credentials) {
     updateMicUI();
     setTimeout(() => {
       if (!agentJoined && room) {
-        setStatus(
-          'لم يردّ العميل بعد. تأكد من تشغيل «python agent.py dev» ثم أنهِ المكالمة وحاول مجددًا.'
-        );
+        setStatus(t('agent_no_response'));
       }
     }, 20000);
   } catch (err) {
