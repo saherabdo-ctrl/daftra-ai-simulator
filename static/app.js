@@ -2853,7 +2853,6 @@ function collectForm(form) {
     if (el.name) data[el.name] = el.value;
   }
   if ('decision_maker' in data) data.decision_maker = data.decision_maker === 'true';
-  if ('knowledgeable' in data) data.knowledgeable = data.knowledgeable === 'true';
   if ('active' in data) data.active = data.active === 'true';
   return data;
 }
