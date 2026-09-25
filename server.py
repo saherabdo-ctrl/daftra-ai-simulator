@@ -7,6 +7,7 @@
 """
 
 import json
+import asyncio
 import logging
 import os
 import random
@@ -1365,6 +1366,51 @@ async def consume_attempt(attempt_id: str, request: Request) -> dict:
         raise HTTPException(status_code=410, detail="Link already used")
 
     return {"ok": True, "attempt_id": attempt_id}
+
+
+# =============================================================================
+# Stale-call sweeper: a call is 'started' until the agent reports its result.
+# If the agent died first (crash, host restart), close it as 'interrupted'
+# once it is older than its classification's max duration + a grace period,
+# so nothing stays "in progress" forever.
+# =============================================================================
+STALE_CALL_DEFAULT_MINUTES = float(os.getenv("STALE_CALL_DEFAULT_MINUTES", "20"))
+STALE_CALL_GRACE_MINUTES = float(os.getenv("STALE_CALL_GRACE_MINUTES", "15"))
+STALE_CALL_SWEEP_SECONDS = 300
+_background_tasks: set = set()
+
+
+def _sweep_stale_calls() -> list:
+    from sheets import get_sheets_client
+    sheets = get_sheets_client()
+    limits = {}
+    for c in sheets.get_classifications():
+        try:
+            limits[str(c.get("classification_id", ""))] = float(c.get("max_duration_minutes") or 0)
+        except (TypeError, ValueError):
+            pass
+    return sheets.close_stale_calls(limits, STALE_CALL_DEFAULT_MINUTES, STALE_CALL_GRACE_MINUTES)
+
+
+async def _stale_call_sweeper() -> None:
+    from alerts import send_alert
+    while True:
+        await asyncio.sleep(STALE_CALL_SWEEP_SECONDS)
+        try:
+            closed = await asyncio.to_thread(_sweep_stale_calls)
+            if closed:
+                ids = ", ".join(c["call_id"] or c["room"] for c in closed)
+                logger.warning("Closed %d stale call(s) as interrupted: %s", len(closed), ids)
+                send_alert(f"Closed {len(closed)} call(s) stuck in progress (agent never reported): {ids}",
+                           key="stale-calls")
+        except Exception as e:
+            logger.warning("Stale-call sweep failed: %s", e)
+
+
+@app.on_event("startup")
+async def _start_background_tasks() -> None:
+    task = asyncio.create_task(_stale_call_sweeper())
+    _background_tasks.add(task)  # keep a reference so it isn't garbage-collected
 
 
 @app.get("/api/calls")

@@ -1,8 +1,9 @@
-# Build-check every push/PR; deploy main to https://enezam.com.
+# Build-check every push/PR; deploy main → https://enezam.com (prod) and
+# staging → https://staging.enezam.com (staging).
 #
 # The deploy job SSHes to the host with a key that can ONLY run one thing:
-# `srv deploy daftra-ai-simulator prod <sha>` (forced command on the server).
-# It sends nothing but the commit SHA. srv builds, starts, health-checks and
+# `srv deploy daftra-ai-simulator <prod|staging> <sha>` (forced command on
+# the server). It sends nothing but the environment name and commit SHA. srv builds, starts, health-checks and
 # rolls back on failure — a red deploy means the site stayed on the last
 # good commit. See DEPLOY.md.
 #
@@ -15,9 +16,9 @@ name: CI / Deploy
 
 on:
   push:
-    branches: [main]
+    branches: [main, staging]
   pull_request:
-    branches: [main]
+    branches: [main, staging]
   workflow_dispatch:
 
 permissions:
@@ -45,17 +46,20 @@ jobs:
         run: docker build --pull -t daftra-ai-simulator:ci .
 
   deploy:
-    name: Deploy to enezam.com
+    name: Deploy (${{ github.ref_name == 'main' && 'prod' || 'staging' }})
     needs: check
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    env:
+      TARGET_ENV: ${{ github.ref_name == 'main' && 'prod' || 'staging' }}
+      SITE_URL: ${{ github.ref_name == 'main' && 'https://enezam.com' || 'https://staging.enezam.com' }}
     environment:
-      name: production
-      url: https://enezam.com
-    # One deploy at a time; a newer push waits rather than cancelling a
-    # deploy that is mid-migration.
+      name: ${{ github.ref_name == 'main' && 'production' || 'staging' }}
+      url: ${{ github.ref_name == 'main' && 'https://enezam.com' || 'https://staging.enezam.com' }}
+    # One deploy per environment at a time; a newer push waits rather than
+    # cancelling a deploy in progress (the agent may be draining a live call).
     concurrency:
-      group: deploy-production
+      group: deploy-${{ github.ref_name }}
       cancel-in-progress: false
     steps:
       - name: Configure SSH
@@ -73,16 +77,16 @@ jobs:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
           ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
-            -o ServerAliveInterval=30 "ghdeploy@${DEPLOY_HOST}" "${GITHUB_SHA}"
+            -o ServerAliveInterval=30 "ghdeploy@${DEPLOY_HOST}" "${TARGET_ENV} ${GITHUB_SHA}"
 
       - name: Verify the live site
         run: |
           for i in $(seq 1 10); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' https://enezam.com/health || true)
-            [ "$code" = "200" ] && { echo "https://enezam.com/health → 200"; exit 0; }
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$SITE_URL/health" || true)
+            [ "$code" = "200" ] && { echo "$SITE_URL/health → 200"; exit 0; }
             sleep 6
           done
-          echo "https://enezam.com/health did not return 200 (last: $code)"; exit 1
+          echo "$SITE_URL/health did not return 200 (last: $code)"; exit 1
 
       - name: Remove key
         if: always()

@@ -434,6 +434,8 @@ const TRANSLATIONS = {
   calls_empty: { ar: 'لا توجد مكالمات بعد.', en: 'No calls yet.' },
   call_default_client_name: { ar: 'عميل ذكي', en: 'AI Client' },
   status_started: { ar: 'جارية', en: 'In progress' },
+  status_interrupted: { ar: 'انقطعت', en: 'Interrupted' },
+  status_failed: { ar: 'فشلت', en: 'Failed' },
   call_id_label: { ar: 'المعرف', en: 'ID' },
   call_classification_label: { ar: 'التصنيف', en: 'Classification' },
   call_caller_label: { ar: 'المصلح', en: 'Trainee' },
@@ -1988,7 +1990,7 @@ function renderCallsList() {
         </label>` : ''}
         <h3>${escapeHtml(c.ai_client_name || t('call_default_client_name'))}</h3>
         <span class="badge ${c.status === 'completed' ? 'badge-completed' : c.status === 'started' ? 'badge-pending' : 'badge-used'}">
-          ${c.status === 'completed' ? t('status_completed') : c.status === 'started' ? t('status_started') : c.status}
+          ${['completed', 'started', 'interrupted', 'failed'].includes(c.status) ? t('status_' + c.status) : c.status}
         </span>
       </div>
       <p class="muted">${t('call_id_label')}: ${escapeHtml(c.call_id || '')}</p>

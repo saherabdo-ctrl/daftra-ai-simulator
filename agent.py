@@ -39,6 +39,24 @@ load_dotenv()
 logger = logging.getLogger("sdr-agent")
 logger.setLevel(logging.INFO)
 
+# Failures worth waking someone up for → chat webhook (alerts.py; off unless
+# ALERT_WEBHOOK_URL is set). Attached to named loggers: the LiveKit CLI
+# reconfigures the root logger's handlers.
+from alerts import AlertLogHandler  # noqa: E402
+
+_alert_handler = AlertLogHandler({
+    "entrypoint did not exit in time": "Agent job was force-stopped mid-call",
+    "all LLMs are unavailable": "All LLMs failing — the AI client cannot reply",
+    "invalid_api_key": "An AI provider rejected its API key",
+    "EVALUATION BLOCKED": "Call ended with an empty transcript (no evaluation)",
+    "Evaluation failed for room": "Call evaluation crashed",
+    "Finalization failed for room": "Call finalization crashed",
+    "had no result — marked failed": "Call ended without a result",
+    "on_session_end timed out": "Call finalization timed out",
+})
+for _name in ("sdr-agent", "livekit.agents"):
+    logging.getLogger(_name).addHandler(_alert_handler)
+
 
 # =============================================================================
 # Candidate Agent
@@ -1443,10 +1461,36 @@ _test_call_link_poller_loop()
 server = AgentServer(
     job_executor_type=JobExecutorType.THREAD,
     num_idle_processes=0,
+    # When the worker stops (deploy/restart) it drains: running calls keep
+    # going, then each job gets entrypoint (15s) + on_session_end (300s) to
+    # finish. Don't let the executor be killed before that.
+    shutdown_process_timeout=330,
 )
 
+# job id → starts (or returns) that call's finalization task; see entrypoint.
+_FINALIZERS: dict[str, Any] = {}
 
-@server.rtc_session(agent_name=AGENT_NAME)
+# Said when every LLM failed for a turn, instead of going silent.
+LLM_APOLOGY_LINES = {
+    "saudi": "معليش ما سمعتك زين، ممكن تعيد كلامك؟",
+    "egyptian": "معلش مسمعتكش كويس، ممكن تعيد تاني؟",
+    "default": "معذرة، لم أسمعك جيدًا، ممكن تعيد كلامك؟",
+}
+
+
+async def _on_session_end(ctx: JobContext) -> None:
+    """Runs after the entrypoint, even when it was cancelled by a shutdown —
+    guarantees every call gets finalized (see FINALIZATION in entrypoint)."""
+    start_finalize = _FINALIZERS.pop(ctx.job.id, None)
+    if start_finalize is None:
+        return
+    try:
+        await start_finalize()
+    except Exception:
+        logger.exception("Finalization failed for room %s", ctx.room.name)
+
+
+@server.rtc_session(agent_name=AGENT_NAME, on_session_end=_on_session_end)
 async def entrypoint(ctx: JobContext) -> None:
     ctx.log_context_fields = {"room": ctx.room.name}
     # اتصال صريح بالغرفة أول حاجة، عشان نضمن إن local_participant جاهز
@@ -1517,11 +1561,172 @@ async def entrypoint(ctx: JobContext) -> None:
         agent.record_item(item)
 
     # ============================================================
+    # FINALIZATION (recording → Drive → evaluation → result + Calls sheet)
+    # Runs exactly once per call, and must finish even when the job is being
+    # shut down: LiveKit gives the entrypoint only 15s after a shutdown starts
+    # (room closed, agent force-disconnected, worker draining) and then cancels
+    # it — that is how calls used to get stuck "in progress". So finalization
+    # is its own task: the entrypoint awaits it shielded, and _on_session_end
+    # (which LiveKit runs after the entrypoint, with a 300s budget) awaits the
+    # same task, starting it if the call never reached a normal end.
+    # ============================================================
+    async def _finalize() -> None:
+        try:
+            await _finalize_steps()
+        finally:
+            # Whatever happened above (empty transcript, evaluation crash,
+            # Sheets hiccup), the call must not stay "in progress" forever.
+            # No-op when the evaluation already marked it completed.
+            try:
+                from sheets import get_sheets_client
+                closed = await asyncio.to_thread(
+                    get_sheets_client().close_call_if_open, ctx.room.name, "failed")
+                if closed:
+                    logger.error("Call %s had no result — marked failed in Calls sheet", ctx.room.name)
+            except Exception as e:
+                logger.warning("Could not close call %s in Calls sheet: %s", ctx.room.name, e)
+
+    async def _finalize_steps() -> None:
+        # on_exit() normally saved the transcript already; after a forced
+        # shutdown it may not have run, and saving twice is harmless.
+        agent._save_call_data()
+        logger.info("SESSION: call ended — beginning finalization")
+
+        # Grace period: wait for agent's last TTS output to finish playing
+        await asyncio.sleep(2.0)
+
+        # ============================================================
+        # LOCAL AUDIO RECORDING
+        # RecorderIO writes to ctx.session_directory/audio.ogg as part of the
+        # session's own teardown (which races with our call_ended signal), so
+        # poll briefly until the file exists and its size stops growing before
+        # copying it into the call's permanent local folder.
+        # ============================================================
+        audio_path = None
+        video_path = None  # video recording is no longer captured
+        call_dir = agent._get_call_dir()
+        os.makedirs(call_dir, exist_ok=True)
+
+        recorder_path = ctx.session_directory / "audio.ogg"
+        last_size = -1
+        for _ in range(25):  # up to ~5s
+            if recorder_path.exists():
+                size = recorder_path.stat().st_size
+                if size > 0 and size == last_size:
+                    break
+                last_size = size
+            await asyncio.sleep(0.2)
+
+        if recorder_path.exists() and recorder_path.stat().st_size > 0:
+            try:
+                audio_path = os.path.join(call_dir, "audio.ogg")
+                shutil.copyfile(recorder_path, audio_path)
+                logger.info("Local audio recording saved: %s (%d bytes)", audio_path, os.path.getsize(audio_path))
+            except Exception as e:
+                logger.error("Failed to save local recording: %s", e)
+                audio_path = None
+        else:
+            logger.error("Local audio recording not found at %s", recorder_path)
+
+        # ============================================================
+        # UPLOAD TO GOOGLE DRIVE
+        # ============================================================
+        audio_recording_obj = None
+        video_recording_obj = None  # video is no longer recorded
+        folder_id = ""
+
+        try:
+            from drive_upload import get_drive_client, find_or_create_folder, upload_audio, FOLDER_NAME
+            drive = get_drive_client()
+            call_dir = agent._get_call_dir()
+            candidate_folder_name = f"{candidate_name or username or 'unknown'} - {candidate_id}" if candidate_id else (username or "unknown")
+
+            # Create folder structure: HiringFlow AI Simulator / Candidate Name - CandidateID
+            candidate_folder_id = find_or_create_folder(drive, candidate_folder_name, parent_name=FOLDER_NAME)
+            if candidate_folder_id and attempt_id:
+                attempt_folder_id = find_or_create_folder(drive, attempt_id, parent_name=candidate_folder_name)
+                if attempt_folder_id:
+                    folder_id = attempt_folder_id
+                else:
+                    folder_id = candidate_folder_id
+            else:
+                folder_id = candidate_folder_id
+
+            # Upload audio and video independently
+            if audio_path and os.path.exists(audio_path):
+                audio_file_id = upload_audio(drive, audio_path, folder_id or candidate_folder_id)
+                if audio_file_id:
+                    audio_url = f"https://drive.google.com/file/d/{audio_file_id}/view"
+                    audio_recording_obj = {
+                        "status": "uploaded",
+                        "file_id": audio_file_id,
+                        "url": audio_url,
+                    }
+                    logger.info("Audio uploaded: file_id=%s url=%s", audio_file_id, audio_url)
+                else:
+                    audio_recording_obj = {"status": "failed", "file_id": "", "url": "", "error": "Upload failed"}
+                    logger.error("Audio upload failed")
+
+        except Exception as e:
+            logger.error("Drive upload error: %s", e)
+
+        # ============================================================
+        # EVALUATION: transcript is finalized, recording is done
+        # ============================================================
+        logger.info("TRANSCRIPT FINALIZED: %d turns", len(agent.transcript))
+        if len(agent.transcript) == 0:
+            logger.error("EVALUATION BLOCKED: transcript is empty — evaluation skipped")
+            logger.error("Candidate result will NOT be written to Sheets (infrastructure failure)")
+        else:
+            # Build recording data for webhook
+            recording_data = {
+                "drive_folder_id": folder_id or "",
+                "audio_recording": audio_recording_obj,
+                "video_recording": video_recording_obj,
+            }
+            await agent.evaluate_and_report(recording_data)
+            logger.info("EVALUATION GENERATED: posting result")
+
+        # ملحوظة: مفيش cleanup هنا عن قصد — ملف الصوت المحلي (audio_path) في
+        # call_dir لازم يفضل محفوظ على الجهاز بشكل دائم، مش ملف مؤقت للرفع بس.
+
+    finalize_task: asyncio.Task | None = None
+
+    def _start_finalize() -> asyncio.Task:
+        nonlocal finalize_task
+        if finalize_task is None:
+            finalize_task = asyncio.create_task(_finalize(), name=f"finalize-{ctx.room.name}")
+        return finalize_task
+
+    _FINALIZERS[ctx.job.id] = _start_finalize
+
+    # لو كل نماذج اللغة فشلت في دور واحد، العميل كان بيسكت ويستنى المندوب
+    # يتكلم تاني. بدل الصمت: جملة قصيرة تطلب منه يعيد كلامه.
+    last_llm_apology = 0.0
+
+    @session.on("error")
+    def _on_session_error(ev: Any) -> None:
+        nonlocal last_llm_apology
+        if not isinstance(getattr(ev, "error", None), llm.LLMError):
+            return
+        now = time.monotonic()
+        if now - last_llm_apology < 15:
+            return
+        last_llm_apology = now
+        logger.warning("LLM error during call (recoverable=%s) — asking the rep to repeat",
+                       getattr(ev.error, "recoverable", "?"))
+        line = LLM_APOLOGY_LINES.get(scenario.get("dialect", ""), LLM_APOLOGY_LINES["default"])
+        try:
+            session.say(line, allow_interruptions=True, add_to_chat_ctx=False)
+        except Exception as e:
+            logger.warning("Could not say LLM apology line: %s", e)
+
+    # ============================================================
     # START SESSION — connects to room AND runs the call
     # Audio recording is handled by AgentSession's built-in local
     # RecorderIO (record="audio") — no LiveKit Egress / S3 involved.
-    # Finalization is triggered by on_exit() in CustomerAgent,
-    # which fires when the session closes due to participant disconnect.
+    # The call ends when on_exit() fires in CustomerAgent: the rep hung up,
+    # or the max-duration timer closed the session.
     # ============================================================
     call_ended = asyncio.Event()
     agent._call_ended_event = call_ended
@@ -1532,108 +1737,8 @@ async def entrypoint(ctx: JobContext) -> None:
     except Exception as e:
         logger.warning("Session start error: %s", e)
 
-    # Block until on_exit() fires (participant disconnect)
     await call_ended.wait()
-    logger.info("SESSION: call ended — beginning finalization")
-
-    # Grace period: wait for agent's last TTS output to finish playing
-    await asyncio.sleep(2.0)
-
-    # ============================================================
-    # LOCAL AUDIO RECORDING
-    # RecorderIO writes to ctx.session_directory/audio.ogg as part of the
-    # session's own teardown (which races with our call_ended signal), so
-    # poll briefly until the file exists and its size stops growing before
-    # copying it into the call's permanent local folder.
-    # ============================================================
-    audio_path = None
-    video_path = None  # video recording is no longer captured
-    call_dir = agent._get_call_dir()
-    os.makedirs(call_dir, exist_ok=True)
-
-    recorder_path = ctx.session_directory / "audio.ogg"
-    last_size = -1
-    for _ in range(25):  # up to ~5s
-        if recorder_path.exists():
-            size = recorder_path.stat().st_size
-            if size > 0 and size == last_size:
-                break
-            last_size = size
-        await asyncio.sleep(0.2)
-
-    if recorder_path.exists() and recorder_path.stat().st_size > 0:
-        try:
-            audio_path = os.path.join(call_dir, "audio.ogg")
-            shutil.copyfile(recorder_path, audio_path)
-            logger.info("Local audio recording saved: %s (%d bytes)", audio_path, os.path.getsize(audio_path))
-        except Exception as e:
-            logger.error("Failed to save local recording: %s", e)
-            audio_path = None
-    else:
-        logger.error("Local audio recording not found at %s", recorder_path)
-
-    # ============================================================
-    # UPLOAD TO GOOGLE DRIVE
-    # ============================================================
-    audio_recording_obj = None
-    video_recording_obj = None  # video is no longer recorded
-    folder_id = ""
-
-    try:
-        from drive_upload import get_drive_client, find_or_create_folder, upload_audio, FOLDER_NAME
-        drive = get_drive_client()
-        call_dir = agent._get_call_dir()
-        candidate_folder_name = f"{candidate_name or username or 'unknown'} - {candidate_id}" if candidate_id else (username or "unknown")
-
-        # Create folder structure: HiringFlow AI Simulator / Candidate Name - CandidateID
-        candidate_folder_id = find_or_create_folder(drive, candidate_folder_name, parent_name=FOLDER_NAME)
-        if candidate_folder_id and attempt_id:
-            attempt_folder_id = find_or_create_folder(drive, attempt_id, parent_name=candidate_folder_name)
-            if attempt_folder_id:
-                folder_id = attempt_folder_id
-            else:
-                folder_id = candidate_folder_id
-        else:
-            folder_id = candidate_folder_id
-
-        # Upload audio and video independently
-        if audio_path and os.path.exists(audio_path):
-            audio_file_id = upload_audio(drive, audio_path, folder_id or candidate_folder_id)
-            if audio_file_id:
-                audio_url = f"https://drive.google.com/file/d/{audio_file_id}/view"
-                audio_recording_obj = {
-                    "status": "uploaded",
-                    "file_id": audio_file_id,
-                    "url": audio_url,
-                }
-                logger.info("Audio uploaded: file_id=%s url=%s", audio_file_id, audio_url)
-            else:
-                audio_recording_obj = {"status": "failed", "file_id": "", "url": "", "error": "Upload failed"}
-                logger.error("Audio upload failed")
-
-    except Exception as e:
-        logger.error("Drive upload error: %s", e)
-
-    # ============================================================
-    # EVALUATION: transcript is finalized, recording is done
-    # ============================================================
-    logger.info("TRANSCRIPT FINALIZED: %d turns", len(agent.transcript))
-    if len(agent.transcript) == 0:
-        logger.error("EVALUATION BLOCKED: transcript is empty — evaluation skipped")
-        logger.error("Candidate result will NOT be written to Sheets (infrastructure failure)")
-    else:
-        # Build recording data for webhook
-        recording_data = {
-            "drive_folder_id": folder_id or "",
-            "audio_recording": audio_recording_obj,
-            "video_recording": video_recording_obj,
-        }
-        await agent.evaluate_and_report(recording_data)
-        logger.info("EVALUATION GENERATED: posting result")
-
-    # ملحوظة: مفيش cleanup هنا عن قصد — ملف الصوت المحلي (audio_path) في
-    # call_dir لازم يفضل محفوظ على الجهاز بشكل دائم، مش ملف مؤقت للرفع بس.
-
+    await asyncio.shield(_start_finalize())
 
 if __name__ == "__main__":
     import asyncio as _asyncio
