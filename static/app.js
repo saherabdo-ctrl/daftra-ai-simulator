@@ -3405,6 +3405,8 @@ async function connectCall(scenario, credentials) {
         ringAudio.volume = 0.8;
         ringAudio.play().catch(() => {});
       }
+      // الـagent قفل المكالمة (وصلت للحد الأقصى للمدة) → نقفل ونعرض التقييم
+      if (topic === 'call_ended' && room) endCall();
     } catch (_) {}
   });
 
@@ -3949,6 +3951,8 @@ async function connectCandidateCall(credentials) {
         ringAudio.volume = 0.8;
         ringAudio.play().catch(() => {});
       }
+      // Agent ended the call (max duration reached) → hang up like the End button
+      if (topic === 'call_ended' && room) endCandidateCall();
     } catch (_) {}
   });
 

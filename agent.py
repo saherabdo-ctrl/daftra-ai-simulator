@@ -665,17 +665,27 @@ class CustomerAgent(Agent):
                     await asyncio.sleep(0.3)
 
     async def _auto_end_after_max_duration(self, max_duration_minutes: float) -> None:
-        """Classification-level hard call-duration limit — disconnects the room
-        from the agent's own side once reached, if the human hasn't already
-        ended the call by then."""
+        """Classification-level hard call-duration limit — ends the call from
+        the agent's side once reached, if the human hasn't already ended it.
+
+        Closes the SESSION, not the room: on_exit() → finalization runs as for a
+        normal hang-up. Disconnecting the room here made LiveKit shut the job
+        down, which cancelled finalization mid-way (no evaluation, call stuck
+        "in progress") and left the human in a silent room."""
         try:
             await asyncio.sleep(max_duration_minutes * 60)
             logger.info(
                 "Max call duration (%.1f min) reached for room %s — ending call",
                 max_duration_minutes, self.room_name,
             )
+            # يبلغ الـfrontend إن المكالمة خلصت عشان يقفل ويعرض التقييم
             if self.room:
-                await self.room.disconnect()
+                try:
+                    payload = json.dumps({"type": "call_ended", "reason": "max_duration"}).encode("utf-8")
+                    await self.room.local_participant.publish_data(payload, topic="call_ended")
+                except Exception as e:
+                    logger.warning("call_ended data failed for room %s: %s", self.room_name, e)
+            self.session.shutdown(drain=True)
         except asyncio.CancelledError:
             pass
         except Exception as e:
