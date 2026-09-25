@@ -1,0 +1,89 @@
+# Build-check every push/PR; deploy main to https://enezam.com.
+#
+# The deploy job SSHes to the host with a key that can ONLY run one thing:
+# `srv deploy daftra-ai-simulator prod <sha>` (forced command on the server).
+# It sends nothing but the commit SHA. srv builds, starts, health-checks and
+# rolls back on failure — a red deploy means the site stayed on the last
+# good commit. See DEPLOY.md.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   DEPLOY_HOST          server address
+#   DEPLOY_SSH_KEY       private key of the restricted `ghdeploy` user
+#   DEPLOY_KNOWN_HOSTS   the server's host key line (pins the host; no TOFU)
+
+name: CI / Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check & build image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Syntax check (all modules compile)
+        run: python -m compileall -q .
+
+      - name: Build production image
+        run: docker build --pull -t daftra-ai-simulator:ci .
+
+  deploy:
+    name: Deploy to enezam.com
+    needs: check
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://enezam.com
+    # One deploy at a time; a newer push waits rather than cancelling a
+    # deploy that is mid-migration.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Deploy ${{ github.sha }}
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            -o ServerAliveInterval=30 "ghdeploy@${DEPLOY_HOST}" "${GITHUB_SHA}"
+
+      - name: Verify the live site
+        run: |
+          for i in $(seq 1 10); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' https://enezam.com/health || true)
+            [ "$code" = "200" ] && { echo "https://enezam.com/health → 200"; exit 0; }
+            sleep 6
+          done
+          echo "https://enezam.com/health did not return 200 (last: $code)"; exit 1
+
+      - name: Remove key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key

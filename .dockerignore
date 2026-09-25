@@ -1,12 +1,27 @@
+.git
+.github
 .venv
 __pycache__
 *.pyc
 .env
-.env.production
+.env.*
+!.env.example
+# runtime state never belongs in the image
 data/results
 data/scenarios
 data/calls
 data/users.json
-.git
+recordings
+*.log
+# service-account keys are mounted at runtime, never baked in
+*-*.json.key
+exalted-*.json
+credentials*.json
+# other hosting targets / local helpers
 start.bat
 start-public.bat
+fly.toml
+render.yaml
+serv00-setup.sh
+passenger_wsgi.py
+Caddyfile
