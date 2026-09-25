@@ -1,34 +1,65 @@
 # ============================================================
-#  DaftraAI-Simulator — Docker Compose (Local Testing)
+#  Daftra AI Simulator — Docker Compose (production-ready; works locally too)
 #
-#  Usage:
-#    cp .env.example .env
-#    # Edit .env with your real API keys + JWT_SECRET
+#  Local:
+#    cp .env.example .env      # fill in your keys
 #    docker compose up -d --build
-#    docker compose logs -f
+#    open http://localhost:8000
 #
-#  Stop:
-#    docker compose down
+#  Production (enezam.com) runs this same file on the deploy host; the host
+#  adds HTTPS/routing and drops the published port. See DEPLOY.md.
 #
-#  Data persists in Docker volumes across restarts.
+#  Two services from ONE image:
+#    web   — FastAPI dashboard + API (the only public service)
+#    agent — LiveKit voice agent; outbound to LiveKit Cloud only, no port
+#  Each restarts on its own: an agent crash no longer takes the site down.
 # ============================================================
+
+x-app: &app
+  image: ${COMPOSE_PROJECT_NAME:-daftra-ai-simulator}-app:${APP_VERSION:-latest}
+  env_file: .env
+  environment: &app-env
+    # Internal topology — fixed here so a laptop .env (localhost URLs,
+    # Windows paths) can never leak into the containers.
+    EVALUATION_WEBHOOK_URL: http://web:8000/api/results
+    SCENARIOS_BASE_URL: http://web:8000
+    RECORDINGS_PATH: /recordings
+  volumes:
+    - state:/app/var          # results, scenarios, calls, users.json, dialect corpus
+    - recordings:/recordings  # written by the agent, listed/served by web
+  restart: unless-stopped
+
 services:
-  app:
+  web:
+    <<: *app
     build: .
-    restart: always
+    command: ["python", "server.py"]
     ports:
       - "8000:8000"
-    env_file: .env
-    volumes:
-      - app_data:/app/data
-      - recordings:/recordings
     healthcheck:
-      test: ["CMD", "python", "-c", "import httpx; r = httpx.get('http://localhost:8000/health'); r.raise_for_status()"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 20s
+
+  agent:
+    <<: *app
+    # Same image as web; built once by the web service.
+    pull_policy: never
+    command: ["python", "agent.py", "start"]
+    depends_on:
+      web:
+        condition: service_healthy
+    # The LiveKit worker serves its own health endpoint on :8081.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8081/', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    stop_grace_period: 60s   # let an in-progress call finish draining
 
 volumes:
-  app_data:
+  state:
   recordings:
