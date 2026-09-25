@@ -58,7 +58,10 @@ services:
       timeout: 5s
       retries: 3
       start_period: 40s
-    stop_grace_period: 60s   # let an in-progress call finish draining
+    # On stop (deploy/restart) the LiveKit worker drains: it takes no new calls
+    # and waits for running ones to end and finalize. 12m covers the longest
+    # call plus its evaluation; an idle agent still stops in seconds.
+    stop_grace_period: 12m
 
 volumes:
   state:

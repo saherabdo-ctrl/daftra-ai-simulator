@@ -1659,6 +1659,66 @@ class GoogleSheetsClient:
             logger.error("Failed to update call end: %s", e)
             return False
 
+    def close_call_if_open(self, room: str, status: str) -> bool:
+        """End a call that is still 'started' (never got a result) with `status`
+        ('failed' / 'interrupted'). Leaves completed calls alone. Returns True
+        if a row was closed."""
+        try:
+            self._ensure_calls_tab()
+            ws = self.sheet.worksheet('Calls')
+            records = ws.get_all_records()
+            for i, row in enumerate(records, start=2):
+                if str(row.get('Room', '')).strip() == room:
+                    if str(row.get('Status', '')).strip() != 'started':
+                        return False
+                    self._close_call_row(ws, i, row, status)
+                    return True
+            return False
+        except Exception as e:
+            logger.error("Failed to close call %s: %s", room, e)
+            return False
+
+    def close_stale_calls(self, max_minutes_by_classification: Dict[str, float],
+                          default_max_minutes: float, grace_minutes: float) -> list[Dict[str, Any]]:
+        """Mark 'started' calls older than their classification's max duration
+        (or `default_max_minutes`) + `grace_minutes` as 'interrupted' — the agent
+        died before it could report. Returns the calls it closed."""
+        from datetime import datetime, timedelta
+        closed = []
+        try:
+            self._ensure_calls_tab()
+            ws = self.sheet.worksheet('Calls')
+            now = datetime.now()
+            for i, row in enumerate(ws.get_all_records(), start=2):
+                if str(row.get('Status', '')).strip() != 'started':
+                    continue
+                try:
+                    started = datetime.strptime(str(row.get('StartedAt', '')).strip(), "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+                limit = max_minutes_by_classification.get(
+                    str(row.get('ClassificationID', '')).strip()) or default_max_minutes
+                if now - started > timedelta(minutes=limit + grace_minutes):
+                    self._close_call_row(ws, i, row, 'interrupted')
+                    closed.append({'call_id': row.get('CallID', ''), 'room': row.get('Room', ''),
+                                   'started_at': row.get('StartedAt', '')})
+        except Exception as e:
+            logger.error("Failed to close stale calls: %s", e)
+        return closed
+
+    @staticmethod
+    def _close_call_row(ws, i: int, row: Dict[str, Any], status: str) -> None:
+        from datetime import datetime
+        ended_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            started = datetime.strptime(str(row.get('StartedAt', '')).strip(), "%Y-%m-%d %H:%M:%S")
+            duration = str(int((datetime.now() - started).total_seconds()))
+        except ValueError:
+            duration = ''
+        ws.update(values=[[ended_at, duration]], range_name=f"H{i}:I{i}")  # EndedAt, Duration
+        ws.update_cell(i, 11, status)                     # Status
+        logger.info("Closed call row %d (room=%s) as %s", i, row.get('Room', ''), status)
+
     def get_calls(self, classification_id: str = None) -> list[Dict[str, Any]]:
         """Get all calls, optionally filtered by classification."""
         try:
